@@ -14,7 +14,7 @@
     "imports": {
       "three": "https://esm.sh/three@0.170.0",
       "three/addons/": "https://esm.sh/three@0.170.0/examples/jsm/",
-      "trystero/mqtt": "https://esm.sh/@trystero-p2p/mqtt@0.26.0"
+      "trystero/torrent": "https://esm.sh/trystero@0.20.0/torrent"
     }
   }
   </script>
@@ -143,6 +143,13 @@
 
   <!-- IN-GAME HUD OVERLAY -->
   <div id="hud-overlay" class="hidden">
+    <!-- Live Online Players Count Badge -->
+    <div id="online-badge" class="online-badge">
+      <span class="online-indicator-dot"></span>
+      <span id="online-count-text">ONLINE: 1</span>
+      <span class="room-code-badge" id="online-room-text">GLOBAL-ARENA</span>
+    </div>
+
     <!-- Dynamic Centered Crosshair -->
     <div id="crosshair">
       <div class="ch-line ch-top"></div>
@@ -223,6 +230,11 @@
   <div id="scoreboard-overlay" class="hidden">
     <div class="scoreboard-container">
       <h2 class="scoreboard-title">ARENA LEADERBOARD</h2>
+      <div class="scoreboard-room-meta">
+        <span>ROOM: <strong id="sb-room-code">GLOBAL-ARENA</strong></span>
+        <span class="meta-separator">•</span>
+        <span id="sb-online-count">1 PLAYER ONLINE</span>
+      </div>
       <table class="scoreboard-table">
         <thead>
           <tr>

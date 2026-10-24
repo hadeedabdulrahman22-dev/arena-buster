@@ -323,6 +323,52 @@ html, body {
   display: none;
 }
 
+/* Live Online Players Count Badge (Top-Left) */
+.online-badge {
+  position: absolute;
+  top: 24px;
+  left: 24px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(10, 15, 24, 0.85);
+  border: 1px solid rgba(0, 240, 255, 0.35);
+  border-radius: 20px;
+  padding: 6px 14px;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  font-family: 'Rajdhani', sans-serif;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #fff;
+  z-index: 100;
+}
+
+.online-indicator-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #00ff66;
+  box-shadow: 0 0 10px #00ff66;
+  animation: onlinePulse 2s infinite ease-in-out;
+}
+
+@keyframes onlinePulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.8); }
+}
+
+.room-code-badge {
+  color: #00f0ff;
+  background: rgba(0, 240, 255, 0.12);
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  border: 1px solid rgba(0, 240, 255, 0.25);
+}
+
 /* Center Crosshair - Strictly locked to viewport center with pixel-perfect symmetry */
 #crosshair {
   position: fixed;
@@ -862,8 +908,30 @@ html, body {
   letter-spacing: 2px;
   color: #00f0ff;
   text-transform: uppercase;
-  margin-bottom: 16px;
+  margin-bottom: 6px;
   text-align: center;
+}
+
+.scoreboard-room-meta {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  color: #94a3b8;
+  margin-bottom: 18px;
+  text-align: center;
+}
+
+.scoreboard-room-meta #sb-room-code {
+  color: #00f0ff;
+}
+
+.scoreboard-room-meta #sb-online-count {
+  color: #00ff66;
+}
+
+.meta-separator {
+  margin: 0 8px;
+  color: rgba(255, 255, 255, 0.3);
 }
 
 .scoreboard-table {

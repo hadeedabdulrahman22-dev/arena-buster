@@ -35,9 +35,15 @@ export class UIManager {
     this.killBanner = document.getElementById('kill-banner');
     this.floatingDamageContainer = document.getElementById('floating-damage-container');
 
+    // Online badge elements
+    this.onlineBadgeCount = document.getElementById('online-count-text');
+    this.onlineBadgeRoom = document.getElementById('online-room-text');
+
     // Scoreboard
     this.scoreboard = document.getElementById('scoreboard-overlay');
     this.scoreboardBody = document.getElementById('scoreboard-table-body');
+    this.sbOnlineCount = document.getElementById('sb-online-count');
+    this.sbRoomCode = document.getElementById('sb-room-code');
 
     // Elimination overlay
     this.eliminationOverlay = document.getElementById('elimination-overlay');
@@ -345,6 +351,23 @@ export class UIManager {
       `;
       this.scoreboardBody.appendChild(row);
     });
+  }
+
+  updateOnlineCount(count, roomId) {
+    const displayCount = Math.max(1, count || 1);
+    const roomStr = roomId || 'GLOBAL-ARENA';
+    if (this.onlineBadgeCount) {
+      this.onlineBadgeCount.textContent = `ONLINE: ${displayCount}`;
+    }
+    if (this.onlineBadgeRoom) {
+      this.onlineBadgeRoom.textContent = roomStr;
+    }
+    if (this.sbOnlineCount) {
+      this.sbOnlineCount.textContent = `${displayCount} ${displayCount === 1 ? 'PLAYER' : 'PLAYERS'} ONLINE`;
+    }
+    if (this.sbRoomCode) {
+      this.sbRoomCode.textContent = roomStr;
+    }
   }
 
   addChatMessage(sender, color, text) {

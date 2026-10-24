@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { joinRoom, selfId } from 'trystero/mqtt';
+import { joinRoom, selfId } from 'trystero/torrent';
 import { WeaponModelBuilder, WEAPON_DATA } from './weapons.js';
 import { audio } from './audio.js';
 
@@ -103,7 +103,7 @@ export class NetworkManager {
 
     // Throttled network packet sender
     this.lastSent = 0;
-    this.sendRateMs = 33; // ~30Hz
+    this.sendRateMs = 50; // 50ms (~20Hz) broadcast loop
 
     // Client-side automatic health regeneration tracking
     this.lastDamageTime = 0;
@@ -128,10 +128,11 @@ export class NetworkManager {
       this.localPlayerRef.respawn(initialSpawn, 100);
     }
 
-    // Initialize self on scoreboard
+    // Initialize self on scoreboard and HUD online counter
     this.updateScoreboardSelf();
+    this.updateOnlineCount();
 
-    // Join Trystero decentralized WebRTC room via public MQTT broker signaling
+    // Join Trystero decentralized WebRTC room via WebTorrent trackers
     const appId = 'arena-buster-p2p-fps';
     this.room = joinRoom({ appId }, this.roomId);
 
@@ -149,9 +150,10 @@ export class NetworkManager {
     // 1. Handle new peer connections
     this.room.onPeerJoin((peerId) => {
       console.log(`[P2P Network] Peer joined room: ${peerId}`);
-      // Send self profile and current location to joining peer
+      // Send self profile and current location to joining peer immediately
       this.sendSelfProfile(peerId);
       this.sendCurrentState(peerId);
+      this.updateOnlineCount();
     });
 
     // 2. Handle peer disconnections
@@ -163,6 +165,7 @@ export class NetworkManager {
       }
       this.removeRemotePlayer(peerId);
       this.announcedPeers.delete(peerId);
+      this.updateOnlineCount();
     });
 
     // 3. Receive peer profiles
@@ -200,6 +203,8 @@ export class NetworkManager {
         }
       }
 
+      this.updateOnlineCount();
+
       this.ui.updateScoreboardEntry({
         id: peerId,
         username: profile.username || 'Operative',
@@ -210,11 +215,12 @@ export class NetworkManager {
       });
     });
 
-    // 4. Continuous state updates (~30Hz)
+    // 4. Continuous state updates (~20Hz / 50ms)
     this.getState((data, peerId) => {
       if (!data || peerId === this.selfId) return;
 
       let remote = this.remotePlayers.get(peerId);
+      // Auto-create remote 3D player mesh inside onState if remotePlayers[peerId] doesn't exist yet!
       if (!remote) {
         this.addRemotePlayer({
           id: peerId,
@@ -222,10 +228,19 @@ export class NetworkManager {
           color: data.color || '#00f0ff',
           weaponClass: data.weaponClass || 'assault',
           health: data.health ?? 100,
-          isAlive: data.isAlive ?? true,
+          isAlive: data.isAlive !== false,
           position: data.position || { x: 0, y: 0, z: 0 }
         });
         remote = this.remotePlayers.get(peerId);
+
+        if (!this.announcedPeers.has(peerId)) {
+          this.announcedPeers.add(peerId);
+          this.ui.addKillFeedMessage(`${data.username || 'Operative'} joined the arena`, 'system');
+        }
+
+        // Return hand-shake profile
+        this.sendSelfProfile(peerId);
+        this.updateOnlineCount();
       }
 
       if (remote) {
@@ -252,6 +267,15 @@ export class NetworkManager {
         }
 
         remote.isAlive = data.isAlive !== false;
+
+        if (typeof data.health === 'number') {
+          remote.updateHealth(data.health, 100);
+        }
+
+        if (data.weaponClass && data.weaponClass !== remote.weaponClass) {
+          remote.changeWeapon(data.weaponClass);
+        }
+      }
 
         if (typeof data.health === 'number') {
           remote.updateHealth(data.health, 100);
@@ -581,6 +605,11 @@ export class NetworkManager {
       deaths: this.deaths,
       score: this.score
     });
+  }
+
+  updateOnlineCount() {
+    const count = this.remotePlayers.size + 1; // self + connected peers
+    this.ui.updateOnlineCount(count, this.roomId);
   }
 
   addRemotePlayer(data) {

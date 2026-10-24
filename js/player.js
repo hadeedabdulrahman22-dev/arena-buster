@@ -77,14 +77,13 @@ export class LocalPlayer {
     this.slideEyeHeight = 0.85; // Lowered camera height when sliding
     this.eyeHeight = 1.7;
 
-    // Tactical Sliding State
+    // Tactical Sliding State (Roblox Hypershot-style persistent slide & slide-hopping)
     this.isSliding = false;
-    this.slideTimer = 0;
-    this.slideDuration = 0.8; // 0.8 seconds
-    this.slideCooldown = 1.1; // 1.1 seconds
+    this.slideCooldown = 0.2; // Brief debounce for responsive slide-hopping
     this.lastSlideTime = -10;
     this.slideDirection = new THREE.Vector3();
-    this.slideInitialSpeed = 22.0; // Fast initial forward burst
+    this.slideInitialSpeed = 22.0; // Fast slide speed
+    this.currentSlideSpeed = 22.0;
     this.slideTiltAngle = -0.09; // Slight camera/weapon roll during slide
     this.currentRoll = 0;
 
@@ -140,6 +139,10 @@ export class LocalPlayer {
             this.velocity.y = this.jumpForce;
             this.canJump = false;
             audio.playJump();
+            // Preserve/refresh slide speed for Hypershot slide-hopping!
+            if (this.isSliding) {
+              this.currentSlideSpeed = Math.max(this.currentSlideSpeed, this.slideInitialSpeed);
+            }
           }
           break;
         case 'KeyC':
@@ -241,7 +244,7 @@ export class LocalPlayer {
   cancelSlide() {
     if (!this.isSliding) return;
     this.isSliding = false;
-    this.slideTimer = 0;
+    this.currentSlideSpeed = 0;
     // Reset slide velocity so camera lerps smoothly back to normal standing
     this.velocity.x = 0;
     this.velocity.z = 0;
@@ -251,7 +254,7 @@ export class LocalPlayer {
     const now = performance.now() / 1000;
     if (this.isSliding || !this.isAlive) return;
     if (now - this.lastSlideTime < this.slideCooldown) return;
-    if (!this.canJump) return; // Must be on the ground
+    if (!this.canJump) return; // Must be on the ground to initiate
 
     // WASD movement inputs relative to camera:
     // W: +1 (forward), S: -1 (backward)
@@ -285,12 +288,7 @@ export class LocalPlayer {
     const forward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw).normalize();
     const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw).normalize();
 
-    // Calculate world-space slide direction:
-    // D + Slide: strictly right
-    // A + Slide: strictly left
-    // S + Slide: strictly backward
-    // W + Slide: strictly forward
-    // W + D, S + D, etc: exact 45-degree diagonal vectors
+    // Calculate world-space slide direction
     const slideDir = new THREE.Vector3()
       .addScaledVector(forward, inputZ)
       .addScaledVector(right, inputX);
@@ -299,7 +297,7 @@ export class LocalPlayer {
 
     this.slideDirection.copy(slideDir);
     this.isSliding = true;
-    this.slideTimer = this.slideDuration;
+    this.currentSlideSpeed = this.slideInitialSpeed; // 22.0
     this.lastSlideTime = now;
 
     // Set camera roll tilt based on slide direction
@@ -312,8 +310,8 @@ export class LocalPlayer {
     }
 
     // Apply speed burst along the locked world-space vector
-    this.velocity.x = this.slideDirection.x * this.slideInitialSpeed;
-    this.velocity.z = this.slideDirection.z * this.slideInitialSpeed;
+    this.velocity.x = this.slideDirection.x * this.currentSlideSpeed;
+    this.velocity.z = this.slideDirection.z * this.currentSlideSpeed;
 
     audio.playSlide();
   }
@@ -567,20 +565,26 @@ export class LocalPlayer {
       this.shoot();
     }
 
-    // 1. Movement & Sliding Physics
+    // 1. Movement & Sliding Physics (Roblox Hypershot-style persistent slide & slide-hopping)
     if (this.isSliding) {
-      this.slideTimer -= delta;
-      const progress = 1.0 - Math.max(0, this.slideTimer / this.slideDuration);
-      // Fast initial forward burst that smoothly decays over 0.8s
-      const currentSlideSpeed = THREE.MathUtils.lerp(this.slideInitialSpeed, this.walkSpeed, Math.pow(progress, 0.75));
-      this.velocity.x = this.slideDirection.x * currentSlideSpeed;
-      this.velocity.z = this.slideDirection.z * currentSlideSpeed;
+      const hasMoveInput = this.moveInput.forward || this.moveInput.backward || this.moveInput.left || this.moveInput.right || this.isSprinting;
 
-      if (this.slideTimer <= 0) {
-        this.isSliding = false;
-        this.velocity.x = 0;
-        this.velocity.z = 0;
+      if (!this.canJump) {
+        // Airborne slide-hop: preserve full fast speed and locked momentum throughout the air!
+        this.currentSlideSpeed = Math.max(this.currentSlideSpeed, this.slideInitialSpeed);
+      } else if (hasMoveInput) {
+        // On ground with movement keys held: sustain continuous high-speed sliding
+        this.currentSlideSpeed = this.slideInitialSpeed;
+      } else {
+        // On ground with no movement keys: decelerate smoothly and cancel slide once stopped
+        this.currentSlideSpeed = THREE.MathUtils.lerp(this.currentSlideSpeed, 0, delta * 3.5);
+        if (this.currentSlideSpeed < 1.0) {
+          this.cancelSlide();
+        }
       }
+
+      this.velocity.x = this.slideDirection.x * this.currentSlideSpeed;
+      this.velocity.z = this.slideDirection.z * this.currentSlideSpeed;
     } else {
       const currentSpeed = this.isSprinting ? this.sprintSpeed : this.walkSpeed;
       this.direction.z = Number(this.moveInput.forward) - Number(this.moveInput.backward);
