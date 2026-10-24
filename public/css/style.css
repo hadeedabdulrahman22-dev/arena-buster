@@ -82,7 +82,21 @@ html, body {
 }
 
 .player-config {
+  margin-bottom: 0;
+}
+
+.lobby-inputs-grid {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 16px;
   margin-bottom: 28px;
+}
+
+@media (max-width: 600px) {
+  .lobby-inputs-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
 }
 
 .input-label {

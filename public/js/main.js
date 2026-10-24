@@ -61,12 +61,12 @@ class GameApp {
     });
 
     // Lobby Play Button Trigger
-    this.ui.onPlayClicked(({ username, weaponClass }) => {
+    this.ui.onPlayClicked(({ username, weaponClass, roomId }) => {
       this.isPlaying = true;
       this.player.equipWeapon(weaponClass);
 
-      // Connect to multiplayer backend
-      this.network.connect(username, weaponClass, () => {
+      // Connect to serverless P2P multiplayer arena
+      this.network.connect(username, weaponClass, roomId, () => {
         // Lock pointer to enter first-person view
         this.player.controls.lock();
       });
@@ -91,8 +91,8 @@ class GameApp {
         if (e.code === 'Enter') {
           if (document.activeElement === chatInput) {
             const text = chatInput.value.trim();
-            if (text && this.network.socket) {
-              this.network.socket.emit('chatMessage', text);
+            if (text && this.network) {
+              this.network.sendChatMessage(text);
             }
             chatInput.value = '';
             chatInput.blur();

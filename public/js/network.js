@@ -1,104 +1,271 @@
 import * as THREE from 'three';
-import { WeaponModelBuilder } from './weapons.js';
+import { joinRoom, selfId } from 'trystero/mqtt';
+import { WeaponModelBuilder, WEAPON_DATA } from './weapons.js';
 import { audio } from './audio.js';
+
+// Pre-defined arena spawn points (ground feet coordinates)
+export const SPAWN_POINTS = [
+  { x: 0, y: 0, z: 35 },
+  { x: 0, y: 0, z: -35 },
+  { x: 35, y: 0, z: 0 },
+  { x: -35, y: 0, z: 0 },
+  { x: 25, y: 0, z: 25 },
+  { x: -25, y: 0, z: -25 },
+  { x: 25, y: 0, z: -25 },
+  { x: -25, y: 0, z: 25 },
+  // Elevated catwalk and terrace spawns
+  { x: 0, y: 4.5, z: 0 },
+  { x: 37, y: 3.2, z: 0 },
+  { x: -37, y: 3.2, z: 0 }
+];
+
+export const PLAYER_COLORS = [
+  '#00f0ff', // Cyber Cyan
+  '#ff0055', // Neon Crimson
+  '#00ff66', // Toxic Green
+  '#ffaa00', // Amber
+  '#b026ff', // Neon Purple
+  '#ffff00', // Bright Yellow
+  '#3b82f6', // Electric Blue
+  '#ec4899'  // Pink
+];
+
+// Helper to select a spawn point that is safely distant from active enemies
+export function getSafeSpawnPoint(remotePlayers = new Map()) {
+  let bestPoint = SPAWN_POINTS[Math.floor(Math.random() * SPAWN_POINTS.length)];
+  let maxMinDist = -1;
+
+  for (const sp of SPAWN_POINTS) {
+    let minDistToEnemy = Infinity;
+    for (const remote of remotePlayers.values()) {
+      if (remote.isAlive) {
+        const dx = sp.x - remote.currentPosition.x;
+        const dz = sp.z - remote.currentPosition.z;
+        const dist = Math.hypot(dx, dz);
+        if (dist < minDistToEnemy) minDistToEnemy = dist;
+      }
+    }
+    if (minDistToEnemy > maxMinDist) {
+      maxMinDist = minDistToEnemy;
+      bestPoint = sp;
+    }
+  }
+
+  return { ...bestPoint };
+}
 
 export class NetworkManager {
   constructor(scene, camera, uiManager) {
     this.scene = scene;
     this.camera = camera;
     this.ui = uiManager;
-    this.socket = null;
-    this.selfId = null;
+    this.selfId = selfId;
     this.localPlayerRef = null;
 
-    // Map of remote players: id -> RemotePlayerInstance
+    this.roomId = 'GLOBAL-ARENA';
+    this.username = 'Operative';
+    this.weaponClass = 'assault';
+    this.color = PLAYER_COLORS[Math.floor(Math.random() * PLAYER_COLORS.length)];
+
+    this.kills = 0;
+    this.deaths = 0;
+    this.score = 0;
+
+    // Remote players map: peerId -> RemotePlayer
     this.remotePlayers = new Map();
 
     // Hitbox meshes lookup for raycaster
     this.enemyHitboxes = [];
 
+    // Peer joined announcement tracker
+    this.announcedPeers = new Set();
+
+    // P2P Room instance & action handles
+    this.room = null;
+    this.sendProfile = null;
+    this.getProfile = null;
+    this.sendState = null;
+    this.getState = null;
+    this.sendShoot = null;
+    this.getShoot = null;
+    this.sendHit = null;
+    this.getHit = null;
+    this.sendDamageConfirm = null;
+    this.getDamageConfirm = null;
+    this.sendHealthUpdate = null;
+    this.getHealthUpdate = null;
+    this.sendKill = null;
+    this.getKill = null;
+    this.sendRespawn = null;
+    this.getRespawn = null;
+    this.sendChat = null;
+    this.getChat = null;
+
     // Throttled network packet sender
     this.lastSent = 0;
     this.sendRateMs = 33; // ~30Hz
+
+    // Client-side automatic health regeneration tracking
+    this.lastDamageTime = 0;
+    this.lastRegenTick = 0;
+    this.isRegenerating = false;
   }
 
   setLocalPlayer(localPlayer) {
     this.localPlayerRef = localPlayer;
   }
 
-  connect(username, weaponClass, onConnected) {
-    // Connect to Socket.io server
-    this.socket = window.io();
+  connect(username, weaponClass, roomId = 'GLOBAL-ARENA', onConnected) {
+    this.username = (username || `Player_${this.selfId.slice(0, 4)}`).trim().slice(0, 16);
+    this.weaponClass = ['assault', 'smg', 'sniper'].includes(weaponClass) ? weaponClass : 'assault';
+    this.roomId = (roomId || 'GLOBAL-ARENA').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '') || 'GLOBAL-ARENA';
 
-    this.socket.on('connect', () => {
-      console.log('[Network] Connected to server! Socket ID:', this.socket.id);
-      this.socket.emit('join', { username, weaponClass });
+    console.log(`[P2P Network] Joining room: ${this.roomId} as ${this.username} (Peer ID: ${this.selfId})`);
+
+    // Pick safe initial spawn point
+    const initialSpawn = getSafeSpawnPoint(this.remotePlayers);
+    if (this.localPlayerRef) {
+      this.localPlayerRef.respawn(initialSpawn, 100);
+    }
+
+    // Initialize self on scoreboard
+    this.updateScoreboardSelf();
+
+    // Join Trystero decentralized WebRTC room via public MQTT broker signaling
+    const appId = 'arena-buster-p2p-fps';
+    this.room = joinRoom({ appId }, this.roomId);
+
+    // Register Trystero action channels
+    [this.sendProfile, this.getProfile] = this.room.makeAction('profile');
+    [this.sendState, this.getState] = this.room.makeAction('state');
+    [this.sendShoot, this.getShoot] = this.room.makeAction('shoot');
+    [this.sendHit, this.getHit] = this.room.makeAction('hit');
+    [this.sendDamageConfirm, this.getDamageConfirm] = this.room.makeAction('damageConfirm');
+    [this.sendHealthUpdate, this.getHealthUpdate] = this.room.makeAction('healthUpdate');
+    [this.sendKill, this.getKill] = this.room.makeAction('kill');
+    [this.sendRespawn, this.getRespawn] = this.room.makeAction('respawn');
+    [this.sendChat, this.getChat] = this.room.makeAction('chat');
+
+    // 1. Handle new peer connections
+    this.room.onPeerJoin((peerId) => {
+      console.log(`[P2P Network] Peer joined room: ${peerId}`);
+      // Send self profile and current location to joining peer
+      this.sendSelfProfile(peerId);
+      this.sendCurrentState(peerId);
     });
 
-    this.socket.on('init', (data) => {
-      this.selfId = data.selfId;
-      console.log('[Network] Initialized self ID:', this.selfId);
-
-      // Spawn initial position
-      if (this.localPlayerRef && data.player && data.player.position) {
-        this.localPlayerRef.respawn(data.player.position, data.player.health);
+    // 2. Handle peer disconnections
+    this.room.onPeerLeave((peerId) => {
+      console.log(`[P2P Network] Peer left room: ${peerId}`);
+      const remote = this.remotePlayers.get(peerId);
+      if (remote) {
+        this.ui.addKillFeedMessage(`${remote.username} left the arena`, 'system');
       }
-
-      // Add existing players in room
-      data.players.forEach(p => {
-        if (p.id !== this.selfId) {
-          this.addRemotePlayer(p);
-        }
-      });
-
-      if (onConnected) onConnected(data);
+      this.removeRemotePlayer(peerId);
+      this.announcedPeers.delete(peerId);
     });
 
-    this.socket.on('playerJoined', (playerData) => {
-      if (playerData.id !== this.selfId) {
-        this.addRemotePlayer(playerData);
-        this.ui.addKillFeedMessage(`${playerData.username} joined the arena`, 'system');
-      }
-    });
+    // 3. Receive peer profiles
+    this.getProfile((profile, peerId) => {
+      if (!profile || peerId === this.selfId) return;
 
-    this.socket.on('playerLeft', (id) => {
-      this.removeRemotePlayer(id);
-    });
+      if (!this.remotePlayers.has(peerId)) {
+        this.addRemotePlayer({
+          id: peerId,
+          username: profile.username || 'Operative',
+          color: profile.color || '#00f0ff',
+          weaponClass: profile.weaponClass || 'assault',
+          health: profile.health ?? 100,
+          isAlive: profile.isAlive ?? true,
+          position: profile.position || { x: 0, y: 0, z: 0 }
+        });
 
-    // High frequency snapshot update
-    this.socket.on('gameState', (data) => {
-      if (!data.players) return;
-      data.players.forEach(p => {
-        if (p.id === this.selfId) {
-          // Update scoreboard data for self
-          this.ui.updateScoreboardEntry(p);
-          return;
+        if (!this.announcedPeers.has(peerId)) {
+          this.announcedPeers.add(peerId);
+          this.ui.addKillFeedMessage(`${profile.username} joined the arena`, 'system');
         }
 
-        const remote = this.remotePlayers.get(p.id);
+        // Return hand-shake profile
+        this.sendSelfProfile(peerId);
+      } else {
+        const remote = this.remotePlayers.get(peerId);
         if (remote) {
-          remote.targetPosition.set(p.position.x, p.position.y, p.position.z);
-          remote.targetRotation.yaw = p.rotation ? p.rotation.yaw : 0;
-          remote.targetRotation.pitch = p.rotation ? p.rotation.pitch : 0;
-          remote.isSprinting = p.isSprinting;
-          remote.isSliding = p.isSliding;
-          remote.isAlive = p.isAlive;
-          remote.updateHealth(p.health, 100);
-
-          if (p.weaponClass !== remote.weaponClass) {
-            remote.changeWeapon(p.weaponClass);
+          remote.username = profile.username;
+          if (profile.weaponClass && profile.weaponClass !== remote.weaponClass) {
+            remote.changeWeapon(profile.weaponClass);
           }
-        } else {
-          this.addRemotePlayer(p);
+          if (typeof profile.health === 'number') {
+            remote.updateHealth(profile.health, 100);
+          }
         }
+      }
 
-        this.ui.updateScoreboardEntry(p);
+      this.ui.updateScoreboardEntry({
+        id: peerId,
+        username: profile.username || 'Operative',
+        color: profile.color || '#00f0ff',
+        kills: profile.kills || 0,
+        deaths: profile.deaths || 0,
+        score: profile.score || 0
       });
     });
 
-    // Remote player shot visual & audio
-    this.socket.on('remotePlayerShot', (data) => {
-      const remote = this.remotePlayers.get(data.id);
+    // 4. Continuous state updates (~30Hz)
+    this.getState((data, peerId) => {
+      if (!data || peerId === this.selfId) return;
+
+      let remote = this.remotePlayers.get(peerId);
+      if (!remote) {
+        this.addRemotePlayer({
+          id: peerId,
+          username: data.username || 'Operative',
+          color: data.color || '#00f0ff',
+          weaponClass: data.weaponClass || 'assault',
+          health: data.health ?? 100,
+          isAlive: data.isAlive ?? true,
+          position: data.position || { x: 0, y: 0, z: 0 }
+        });
+        remote = this.remotePlayers.get(peerId);
+      }
+
+      if (remote) {
+        if (data.position) {
+          remote.targetPosition.set(data.position.x, data.position.y, data.position.z);
+        }
+        if (data.rotation) {
+          remote.targetRotation.yaw = data.rotation.yaw ?? 0;
+          remote.targetRotation.pitch = data.rotation.pitch ?? 0;
+        }
+        remote.isSprinting = !!data.isSprinting;
+        remote.isSliding = !!data.isSliding;
+        remote.isAlive = data.isAlive !== false;
+
+        if (typeof data.health === 'number') {
+          remote.updateHealth(data.health, 100);
+        }
+
+        if (data.weaponClass && data.weaponClass !== remote.weaponClass) {
+          remote.changeWeapon(data.weaponClass);
+        }
+      }
+
+      if (data.kills !== undefined || data.deaths !== undefined || data.score !== undefined) {
+        this.ui.updateScoreboardEntry({
+          id: peerId,
+          username: data.username || remote?.username || 'Operative',
+          color: data.color || remote?.color || '#00f0ff',
+          kills: data.kills || 0,
+          deaths: data.deaths || 0,
+          score: data.score || 0
+        });
+      }
+    });
+
+    // 5. Remote player shooting visual & sound
+    this.getShoot((data, peerId) => {
+      if (!data || peerId === this.selfId) return;
+
+      const remote = this.remotePlayers.get(peerId);
       const origin = new THREE.Vector3(data.origin.x, data.origin.y, data.origin.z);
       const hitPoint = new THREE.Vector3(data.hitPoint.x, data.hitPoint.y, data.hitPoint.z);
 
@@ -106,60 +273,129 @@ export class NetworkManager {
         remote.triggerMuzzleFlash();
       }
 
-      // Distance to camera for audio attenuation
+      // Distance audio attenuation
       const dist = this.camera.position.distanceTo(origin);
-      audio.playGunshot(data.weaponClass, true, dist);
+      audio.playGunshot(data.weaponClass || 'assault', true, dist);
 
-      // Render tracer line
+      // Render 3D bullet tracer line
       this.spawnTracer(origin, hitPoint);
     });
 
-    // Authoritative hit confirmations
-    this.socket.on('damageDealt', (data) => {
-      // Audio feedback
-      audio.playHitmarker(data.isHeadshot);
+    // 6. Direct Hit Registration (sent to local player from attacker)
+    this.getHit((data, peerId) => {
+      if (!data || !this.localPlayerRef || !this.localPlayerRef.isAlive) return;
 
-      // UI Hitmarker & floating combat text
+      const damage = data.damage || 20;
+      const isHeadshot = !!data.isHeadshot;
+      const hitPoint = data.hitPoint || { x: this.camera.position.x, y: this.camera.position.y, z: this.camera.position.z };
+
+      // Deduct health locally
+      this.localPlayerRef.health = Math.max(0, this.localPlayerRef.health - damage);
+      this.lastDamageTime = Date.now();
+      this.isRegenerating = false;
+
+      // Audio & visual feedback on hit
+      audio.playDamageTaken();
+      this.ui.triggerDamageFlash();
+      this.ui.updateHealth(this.localPlayerRef.health, 100, false);
+
+      // Send damage confirmation directly back to the attacker
+      this.sendDamageConfirm({
+        damage,
+        isHeadshot,
+        hitPoint,
+        remainingHealth: this.localPlayerRef.health,
+        victimId: this.selfId
+      }, peerId);
+
+      // Broadcast health update to room for overhead health bars
+      this.sendHealthUpdate({
+        playerId: this.selfId,
+        health: this.localPlayerRef.health,
+        maxHealth: 100,
+        isRegenerating: false
+      });
+
+      // Handle elimination
+      if (this.localPlayerRef.health <= 0) {
+        this.localPlayerRef.isAlive = false;
+        this.localPlayerRef.isADS = false;
+        this.ui.setAds(false, false);
+        this.deaths += 1;
+        this.updateScoreboardSelf();
+
+        // Broadcast elimination event to all peers
+        this.sendKill({
+          killerId: data.attackerId,
+          killerName: data.attackerName || 'Enemy',
+          victimId: this.selfId,
+          victimName: this.username,
+          weaponClass: data.weaponClass || 'assault',
+          isHeadshot
+        });
+
+        // Local elimination UI & sound
+        audio.playElimination();
+        this.ui.showEliminationScreen(data.attackerName || 'Enemy', isHeadshot, 3000);
+
+        // Client-side 3-second safe auto-respawn
+        setTimeout(() => {
+          const respawnPoint = getSafeSpawnPoint(this.remotePlayers);
+          this.localPlayerRef.health = 100;
+          this.localPlayerRef.isAlive = true;
+          this.lastDamageTime = 0;
+          this.isRegenerating = false;
+          this.localPlayerRef.respawn(respawnPoint, 100);
+
+          // Broadcast respawn event to all peers
+          this.sendRespawn({
+            id: this.selfId,
+            position: respawnPoint,
+            health: 100
+          });
+        }, 3000);
+      }
+    });
+
+    // 7. Damage Confirmation (received by attacker when target takes damage)
+    this.getDamageConfirm((data) => {
+      if (!data) return;
+      audio.playHitmarker(data.isHeadshot);
       this.ui.showHitmarker(data.isHeadshot);
       if (data.hitPoint) {
         this.ui.spawnFloatingDamage(data.hitPoint, data.damage, data.isHeadshot, this.camera);
       }
     });
 
-    this.socket.on('damageTaken', (data) => {
-      audio.playDamageTaken();
-      this.ui.triggerDamageFlash();
-      if (this.localPlayerRef) {
-        this.localPlayerRef.health = data.remainingHealth;
-        this.ui.updateHealth(data.remainingHealth, 100, false);
+    // 8. Overhead Health Updates
+    this.getHealthUpdate((data, peerId) => {
+      if (!data) return;
+      const targetId = data.playerId || peerId;
+      if (targetId === this.selfId) return;
+
+      const remote = this.remotePlayers.get(targetId);
+      if (remote) {
+        remote.updateHealth(data.health, data.maxHealth || 100);
       }
     });
 
-    this.socket.on('healthUpdate', (data) => {
-      if (data.playerId === this.selfId) {
-        if (this.localPlayerRef) {
-          this.localPlayerRef.health = data.health;
-          this.ui.updateHealth(data.health, data.maxHealth, data.isRegenerating);
-        }
-      } else {
-        const remote = this.remotePlayers.get(data.playerId);
-        if (remote) {
-          remote.updateHealth(data.health, data.maxHealth);
-        }
-      }
-    });
+    // 9. Kill announcements
+    this.getKill((data) => {
+      if (!data) return;
 
-    this.socket.on('playerKilled', (data) => {
       this.ui.addKillFeedKill(data.killerName, data.victimName, data.weaponClass, data.isHeadshot);
 
+      // If local player was the killer
       if (data.killerId === this.selfId) {
+        this.kills += 1;
+        this.score += data.isHeadshot ? 150 : 100;
         audio.playKillConfirmed();
         this.ui.showKillBanner(data.victimName, data.isHeadshot);
+        this.updateScoreboardSelf();
       }
 
-      if (data.victimId === this.selfId) {
-        audio.playElimination();
-      } else {
+      // If victim was a remote player
+      if (data.victimId !== this.selfId) {
         const remote = this.remotePlayers.get(data.victimId);
         if (remote) {
           remote.onEliminated();
@@ -167,50 +403,168 @@ export class NetworkManager {
       }
     });
 
-    this.socket.on('eliminated', (data) => {
-      if (this.localPlayerRef) {
-        this.localPlayerRef.isAlive = false;
-        this.localPlayerRef.isADS = false;
-        this.ui.setAds(false, false);
-      }
-      this.ui.showEliminationScreen(data.killerName, data.isHeadshot, data.respawnTimeMs);
-    });
+    // 10. Remote Player Respawn
+    this.getRespawn((data, peerId) => {
+      if (!data) return;
+      const targetId = data.id || peerId;
+      if (targetId === this.selfId) return;
 
-    this.socket.on('respawn', (data) => {
-      if (this.localPlayerRef) {
-        this.localPlayerRef.respawn(data.position, data.health);
+      const remote = this.remotePlayers.get(targetId);
+      if (remote && data.position) {
+        remote.onRespawn(data.position);
       }
     });
 
-    this.socket.on('playerRespawned', (data) => {
-      if (data.id !== this.selfId) {
-        const remote = this.remotePlayers.get(data.id);
-        if (remote) {
-          remote.onRespawn(data.position);
-        }
-      }
+    // 11. In-game text chat
+    this.getChat((data) => {
+      if (!data) return;
+      this.ui.addChatMessage(data.sender, data.color, data.text);
     });
 
-    this.socket.on('playerWeaponChanged', (data) => {
-      const remote = this.remotePlayers.get(data.id);
-      if (remote) {
-        remote.changeWeapon(data.weaponClass);
-      }
-    });
+    this.ui.addKillFeedMessage(`Connected to room: [${this.roomId}]`, 'system');
+    if (onConnected) onConnected();
+  }
 
-    this.socket.on('chatMessage', (msg) => {
-      this.ui.addChatMessage(msg.sender, msg.color, msg.text);
-    });
+  sendSelfProfile(targetPeerId = null) {
+    if (!this.sendProfile) return;
+    const profile = {
+      id: this.selfId,
+      username: this.username,
+      weaponClass: this.weaponClass,
+      color: this.color,
+      health: this.localPlayerRef ? this.localPlayerRef.health : 100,
+      isAlive: this.localPlayerRef ? this.localPlayerRef.isAlive : true,
+      kills: this.kills,
+      deaths: this.deaths,
+      score: this.score,
+      position: this.localPlayerRef ? {
+        x: this.camera.position.x,
+        y: this.camera.position.y - this.localPlayerRef.eyeHeight,
+        z: this.camera.position.z
+      } : { x: 0, y: 0, z: 0 }
+    };
+
+    if (targetPeerId) {
+      this.sendProfile(profile, targetPeerId);
+    } else {
+      this.sendProfile(profile);
+    }
+  }
+
+  sendCurrentState(targetPeerId = null) {
+    if (!this.sendState || !this.localPlayerRef) return;
+    const camEuler = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ');
+    const state = {
+      id: this.selfId,
+      username: this.username,
+      color: this.color,
+      weaponClass: this.weaponClass,
+      position: {
+        x: this.camera.position.x,
+        y: this.camera.position.y - this.localPlayerRef.eyeHeight,
+        z: this.camera.position.z
+      },
+      rotation: {
+        yaw: camEuler.y,
+        pitch: camEuler.x
+      },
+      velocity: {
+        x: this.localPlayerRef.velocity.x,
+        y: this.localPlayerRef.velocity.y,
+        z: this.localPlayerRef.velocity.z
+      },
+      isSprinting: this.localPlayerRef.isSprinting,
+      isSliding: this.localPlayerRef.isSliding,
+      health: this.localPlayerRef.health,
+      isAlive: this.localPlayerRef.isAlive,
+      kills: this.kills,
+      deaths: this.deaths,
+      score: this.score
+    };
+
+    if (targetPeerId) {
+      this.sendState(state, targetPeerId);
+    } else {
+      this.sendState(state);
+    }
   }
 
   sendPlayerState(state) {
-    if (!this.socket || !this.socket.connected) return;
+    if (!this.sendState) return;
 
     const now = performance.now();
     if (now - this.lastSent < this.sendRateMs) return;
     this.lastSent = now;
 
-    this.socket.emit('playerMove', state);
+    this.sendState({
+      id: this.selfId,
+      username: this.username,
+      color: this.color,
+      weaponClass: this.weaponClass,
+      ...state,
+      health: this.localPlayerRef ? this.localPlayerRef.health : 100,
+      isAlive: this.localPlayerRef ? this.localPlayerRef.isAlive : true,
+      kills: this.kills,
+      deaths: this.deaths,
+      score: this.score
+    });
+  }
+
+  recordHit(targetId, hitboxType, hitPoint) {
+    if (!this.sendHit) return;
+
+    const weapon = WEAPONS_STATS[this.weaponClass] || WEAPONS_STATS.assault;
+    const isHeadshot = hitboxType === 'head';
+    const baseDamage = weapon.damage;
+    const actualDamage = isHeadshot ? Math.round(baseDamage * weapon.headMultiplier) : baseDamage;
+
+    // Send hit payload directly to target peer
+    this.sendHit({
+      damage: actualDamage,
+      isHeadshot,
+      hitPoint: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z },
+      attackerId: this.selfId,
+      attackerName: this.username,
+      weaponClass: this.weaponClass
+    }, targetId);
+  }
+
+  broadcastShoot(origin, direction, hitPoint) {
+    if (!this.sendShoot) return;
+    this.sendShoot({
+      origin: { x: origin.x, y: origin.y, z: origin.z },
+      direction: { x: direction.x, y: direction.y, z: direction.z },
+      hitPoint: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z },
+      weaponClass: this.weaponClass
+    });
+  }
+
+  changeWeapon(newWeaponClass) {
+    this.weaponClass = newWeaponClass;
+    this.sendSelfProfile();
+  }
+
+  sendChatMessage(text) {
+    const cleanText = (text || '').toString().trim().slice(0, 100);
+    if (!cleanText || !this.sendChat) return;
+
+    this.sendChat({
+      sender: this.username,
+      color: this.color,
+      text: cleanText
+    });
+    this.ui.addChatMessage(this.username, this.color, cleanText);
+  }
+
+  updateScoreboardSelf() {
+    this.ui.updateScoreboardEntry({
+      id: this.selfId,
+      username: this.username,
+      color: this.color,
+      kills: this.kills,
+      deaths: this.deaths,
+      score: this.score
+    });
   }
 
   addRemotePlayer(data) {
@@ -232,10 +586,10 @@ export class NetworkManager {
 
   rebuildHitboxCache() {
     this.enemyHitboxes = [];
-    for (const [id, remote] of this.remotePlayers.entries()) {
+    for (const remote of this.remotePlayers.values()) {
       if (remote.isAlive) {
-        this.enemyHitboxes.push(remote.headHitbox);
-        this.enemyHitboxes.push(remote.bodyHitbox);
+        if (remote.headHitbox) this.enemyHitboxes.push(remote.headHitbox);
+        if (remote.bodyHitbox) this.enemyHitboxes.push(remote.bodyHitbox);
       }
     }
   }
@@ -269,11 +623,52 @@ export class NetworkManager {
   }
 
   update(delta) {
+    // 1. Update all remote player animations & interpolation
     for (const remote of this.remotePlayers.values()) {
       remote.update(delta);
     }
+
+    // 2. Client-side automatic health regeneration (5-second delay, +5 HP every 250ms)
+    if (this.localPlayerRef && this.localPlayerRef.isAlive && this.localPlayerRef.health < 100) {
+      const now = Date.now();
+      if (this.lastDamageTime > 0 && now - this.lastDamageTime >= 5000) {
+        if (now - this.lastRegenTick >= 250) {
+          this.lastRegenTick = now;
+          const prevHp = this.localPlayerRef.health;
+          this.localPlayerRef.health = Math.min(100, this.localPlayerRef.health + 5);
+          this.isRegenerating = this.localPlayerRef.health < 100;
+
+          if (this.localPlayerRef.health !== prevHp) {
+            this.ui.updateHealth(this.localPlayerRef.health, 100, this.isRegenerating);
+
+            if (this.sendHealthUpdate) {
+              this.sendHealthUpdate({
+                playerId: this.selfId,
+                health: this.localPlayerRef.health,
+                maxHealth: 100,
+                isRegenerating: this.isRegenerating
+              });
+            }
+          }
+
+          if (!this.isRegenerating) {
+            this.lastDamageTime = 0;
+          }
+        }
+      }
+    } else if (this.isRegenerating) {
+      this.isRegenerating = false;
+      this.ui.updateHealth(this.localPlayerRef?.health || 100, 100, false);
+    }
   }
 }
+
+// Balance stats lookup
+const WEAPONS_STATS = {
+  assault: { damage: 24, headMultiplier: 2.0 },
+  smg: { damage: 16, headMultiplier: 2.0 },
+  sniper: { damage: 80, headMultiplier: 2.0 }
+};
 
 // Representation of another connected player in 3D
 class RemotePlayer {
@@ -340,7 +735,7 @@ class RemotePlayer {
     this.bodyMesh.add(vest);
 
     // 2. Head & Helmet (Hitbox: head)
-    const headGeo = new THREE.SphereGeometry(0.24, 16, 16);
+    const headGeo = new THREE.BoxGeometry(0.42, 0.45, 0.45);
     this.headMesh = new THREE.Mesh(headGeo, armorMat);
     this.headMesh.position.y = 1.72;
     this.headMesh.castShadow = true;
@@ -352,63 +747,65 @@ class RemotePlayer {
     this.root.add(this.headMesh);
     this.headHitbox = this.headMesh;
 
-    // Glowing Visor on Helmet
-    const visorGeo = new THREE.BoxGeometry(0.28, 0.1, 0.12);
+    // Glowing Neon Visor on Face
+    const visorGeo = new THREE.BoxGeometry(0.34, 0.12, 0.08);
     const visor = new THREE.Mesh(visorGeo, visorMat);
-    visor.position.set(0, 0.02, -0.19);
+    visor.position.set(0, 0.02, 0.22);
     this.headMesh.add(visor);
 
-    // 3. Arms & Hands holding weapon
-    const armGeo = new THREE.BoxGeometry(0.16, 0.65, 0.16);
+    // 3. Arms & Shoulders
+    const armGeo = new THREE.BoxGeometry(0.2, 0.75, 0.2);
     this.leftArm = new THREE.Mesh(armGeo, armorMat);
-    this.leftArm.position.set(-0.45, 1.0, -0.1);
-    this.leftArm.rotation.x = -0.5;
+    this.leftArm.position.set(-0.48, 1.05, 0);
+    this.leftArm.castShadow = true;
     this.root.add(this.leftArm);
 
     this.rightArm = new THREE.Mesh(armGeo, armorMat);
-    this.rightArm.position.set(0.45, 1.0, -0.1);
-    this.rightArm.rotation.x = -0.5;
+    this.rightArm.position.set(0.48, 1.05, 0);
+    this.rightArm.castShadow = true;
     this.root.add(this.rightArm);
 
-    // Weapon mesh held in hands
-    this.weaponHolder = new THREE.Group();
-    this.weaponHolder.position.set(0.3, 0.95, -0.3);
-    this.root.add(this.weaponHolder);
-    this.equipThirdPersonWeapon(this.weaponClass);
-
-    // 4. Legs (Animated for walking / running)
-    const legGeo = new THREE.BoxGeometry(0.22, 0.7, 0.22);
+    // 4. Legs
+    const legGeo = new THREE.BoxGeometry(0.24, 0.65, 0.24);
     this.leftLeg = new THREE.Mesh(legGeo, armorMat);
-    this.leftLeg.position.set(-0.2, 0.35, 0);
+    this.leftLeg.position.set(-0.2, 0.32, 0);
     this.leftLeg.castShadow = true;
     this.root.add(this.leftLeg);
 
     this.rightLeg = new THREE.Mesh(legGeo, armorMat);
-    this.rightLeg.position.set(0.2, 0.35, 0);
+    this.rightLeg.position.set(0.2, 0.32, 0);
     this.rightLeg.castShadow = true;
     this.root.add(this.rightLeg);
+
+    // 5. Weapon Holder attached to right hand
+    this.weaponHolder = new THREE.Group();
+    this.weaponHolder.position.set(0.35, 0.95, 0.35);
+    this.root.add(this.weaponHolder);
+
+    this.changeWeapon(this.weaponClass);
   }
 
-  equipThirdPersonWeapon(weaponId) {
+  changeWeapon(weaponClass) {
+    this.weaponClass = weaponClass;
     while (this.weaponHolder.children.length > 0) {
       this.weaponHolder.remove(this.weaponHolder.children[0]);
     }
 
-    this.weaponClass = weaponId;
-    this.weaponMesh = WeaponModelBuilder.createThirdPersonModel(weaponId);
-    this.weaponHolder.add(this.weaponMesh);
+    const model = WeaponModelBuilder.createWorldModel(weaponClass);
+    model.scale.set(0.85, 0.85, 0.85);
+    this.weaponHolder.add(model);
 
-    // Muzzle flash mesh
-    this.muzzleFlash = WeaponModelBuilder.createMuzzleFlash();
+    // Muzzle flash point
+    const flashGeo = new THREE.SphereGeometry(0.12, 6, 6);
+    const flashMat = new THREE.MeshBasicMaterial({
+      color: 0xffaa00,
+      transparent: true,
+      opacity: 0.9
+    });
+    this.muzzleFlash = new THREE.Mesh(flashGeo, flashMat);
+    this.muzzleFlash.position.set(0, 0, 0.7);
     this.muzzleFlash.visible = false;
     this.weaponHolder.add(this.muzzleFlash);
-    if (this.weaponMesh.userData.muzzlePos) {
-      this.muzzleFlash.position.copy(this.weaponMesh.userData.muzzlePos);
-    }
-  }
-
-  changeWeapon(weaponId) {
-    this.equipThirdPersonWeapon(weaponId);
   }
 
   triggerMuzzleFlash() {
@@ -416,16 +813,18 @@ class RemotePlayer {
     this.muzzleFlash.visible = true;
     setTimeout(() => {
       if (this.muzzleFlash) this.muzzleFlash.visible = false;
-    }, 45);
+    }, 50);
   }
 
   buildNameplate() {
     this.nameplateCanvas = document.createElement('canvas');
     this.nameplateCanvas.width = 256;
-    this.nameplateCanvas.height = 64;
+    this.nameplateCanvas.height = 72;
     this.nameplateCtx = this.nameplateCanvas.getContext('2d');
 
     this.nameplateTexture = new THREE.CanvasTexture(this.nameplateCanvas);
+    this.nameplateTexture.minFilter = THREE.LinearFilter;
+
     const spriteMat = new THREE.SpriteMaterial({
       map: this.nameplateTexture,
       transparent: true,
@@ -433,73 +832,76 @@ class RemotePlayer {
     });
 
     this.nameplateSprite = new THREE.Sprite(spriteMat);
-    this.nameplateSprite.position.y = 2.3;
-    this.nameplateSprite.scale.set(2.4, 0.6, 1.0);
+    this.nameplateSprite.position.set(0, 2.3, 0);
+    this.nameplateSprite.scale.set(1.8, 0.5, 1);
     this.root.add(this.nameplateSprite);
-
-    this.redrawNameplate(100, 100);
-  }
-
-  redrawNameplate(health, maxHealth) {
-    const ctx = this.nameplateCtx;
-    const w = 256;
-    const h = 64;
-
-    ctx.clearRect(0, 0, w, h);
-
-    // Background pill
-    ctx.fillStyle = 'rgba(10, 15, 25, 0.75)';
-    ctx.beginPath();
-    ctx.roundRect(10, 4, w - 20, h - 8, 8);
-    ctx.fill();
-
-    // Username
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 22px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(this.username, w / 2, 28);
-
-    // Health bar container
-    const barX = 24;
-    const barY = 38;
-    const barW = w - 48;
-    const barH = 10;
-
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
-    ctx.fillRect(barX, barY, barW, barH);
-
-    // Health bar fill
-    const healthPct = Math.max(0, Math.min(1.0, health / maxHealth));
-    let barColor = '#00f0ff';
-    if (healthPct < 0.35) barColor = '#ff0055';
-    else if (healthPct < 0.65) barColor = '#f59e0b';
-
-    ctx.fillStyle = barColor;
-    ctx.fillRect(barX, barY, barW * healthPct, barH);
-
-    this.nameplateTexture.needsUpdate = true;
   }
 
   updateHealth(health, maxHealth = 100) {
-    this.health = health;
-    this.redrawNameplate(health, maxHealth);
+    if (!this.nameplateCtx) return;
+    const ctx = this.nameplateCtx;
+    const w = 256;
+    const h = 72;
+
+    ctx.clearRect(0, 0, w, h);
+
+    // Dark semi-transparent pill background
+    ctx.fillStyle = 'rgba(10, 15, 24, 0.85)';
+    ctx.beginPath();
+    ctx.roundRect(10, 6, w - 20, h - 12, 10);
+    ctx.fill();
+
+    // Border glow with player team color
+    ctx.strokeStyle = this.color;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // Username label
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 20px Rajdhani, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(this.username, w / 2, 28);
+
+    // Health bar track
+    const barX = 24;
+    const barY = 36;
+    const barW = w - 48;
+    const barH = 10;
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+    ctx.beginPath();
+    ctx.roundRect(barX, barY, barW, barH, 4);
+    ctx.fill();
+
+    // Health bar fill
+    const pct = Math.max(0, Math.min(1.0, health / maxHealth));
+    const fillW = Math.max(0, barW * pct);
+
+    ctx.fillStyle = pct > 0.4 ? this.color : '#ff0055';
+    ctx.beginPath();
+    ctx.roundRect(barX, barY, fillW, barH, 4);
+    ctx.fill();
+
+    this.nameplateTexture.needsUpdate = true;
   }
 
   onEliminated() {
     this.isAlive = false;
     this.root.visible = false;
-    this.bodyMesh.userData.isHitbox = false;
-    this.headMesh.userData.isHitbox = false;
+    if (this.bodyMesh) this.bodyMesh.userData.isHitbox = false;
+    if (this.headMesh) this.headMesh.userData.isHitbox = false;
   }
 
-  onRespawn(pos) {
+  onRespawn(newPosition) {
     this.isAlive = true;
-    this.currentPosition.set(pos.x, pos.y, pos.z);
-    this.targetPosition.copy(this.currentPosition);
-    this.root.position.copy(this.currentPosition);
+    if (newPosition) {
+      this.currentPosition.set(newPosition.x, newPosition.y, newPosition.z);
+      this.targetPosition.copy(this.currentPosition);
+      this.root.position.copy(this.currentPosition);
+    }
     this.root.visible = true;
-    this.bodyMesh.userData.isHitbox = true;
-    this.headMesh.userData.isHitbox = true;
+    if (this.bodyMesh) this.bodyMesh.userData.isHitbox = true;
+    if (this.headMesh) this.headMesh.userData.isHitbox = true;
     this.updateHealth(100, 100);
   }
 

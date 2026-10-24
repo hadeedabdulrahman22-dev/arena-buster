@@ -12,8 +12,9 @@
   <script type="importmap">
   {
     "imports": {
-      "three": "/three/build/three.module.js",
-      "three/addons/": "/three/examples/jsm/"
+      "three": "https://esm.sh/three@0.170.0",
+      "three/addons/": "https://esm.sh/three@0.170.0/examples/jsm/",
+      "trystero/mqtt": "https://esm.sh/@trystero-p2p/mqtt@0.26.0"
     }
   }
   </script>
@@ -30,10 +31,16 @@
         <div class="game-subtitle">Fast-Paced 3D Multiplayer Arena Shooter</div>
       </div>
 
-      <!-- Player Username Configuration -->
-      <div class="player-config">
-        <label class="input-label" for="username-input">OPERATIVE CODENAME</label>
-        <input type="text" id="username-input" class="tactical-input" placeholder="Enter username..." maxlength="16" autocomplete="off" spellcheck="false">
+      <!-- Player Username & Room Configuration -->
+      <div class="lobby-inputs-grid">
+        <div class="player-config">
+          <label class="input-label" for="username-input">OPERATIVE CODENAME</label>
+          <input type="text" id="username-input" class="tactical-input" placeholder="Enter username..." maxlength="16" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="player-config">
+          <label class="input-label" for="room-input">ARENA ROOM CODE</label>
+          <input type="text" id="room-input" class="tactical-input" value="GLOBAL-ARENA" placeholder="GLOBAL-ARENA" maxlength="24" autocomplete="off" spellcheck="false">
+        </div>
       </div>
 
       <!-- Weapon Class Selection -->
@@ -246,10 +253,7 @@
     </div>
   </div>
 
-  <!-- Socket.io client -->
-  <script src="/socket.io/socket.io.js"></script>
-
-  <!-- Game entrypoint -->
+  <!-- Game entrypoint (100% Serverless WebRTC P2P) -->
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

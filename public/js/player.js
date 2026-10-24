@@ -303,7 +303,7 @@ export class LocalPlayer {
     if (newWeaponId === this.weaponClass || !WEAPON_DATA[newWeaponId]) return;
     this.equipWeapon(newWeaponId);
     if (this.network) {
-      this.network.socket.emit('changeWeapon', newWeaponId);
+      this.network.changeWeapon(newWeaponId);
     }
   }
 
@@ -364,12 +364,9 @@ export class LocalPlayer {
         const targetId = hitObject.userData.playerId;
         const hitboxType = hitObject.userData.hitboxType; // 'head' or 'body'
 
-        // Inform server of hit for authoritative verification and damage application
-        this.network.socket.emit('playerHit', {
-          targetId,
-          hitboxType,
-          hitPoint: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z }
-        });
+        if (this.network) {
+          this.network.recordHit(targetId, hitboxType, hitPoint);
+        }
       } else {
         // Hit environment: spawn spark particles
         this.spawnSparks(hitPoint, hit.face ? hit.face.normal : new THREE.Vector3(0, 1, 0));
@@ -386,11 +383,9 @@ export class LocalPlayer {
     this.spawnTracer(gunMuzzleWorld, hitPoint);
 
     // Broadcast shoot event to other players
-    this.network.socket.emit('playerShoot', {
-      origin: { x: gunMuzzleWorld.x, y: gunMuzzleWorld.y, z: gunMuzzleWorld.z },
-      direction: { x: rayDir.x, y: rayDir.y, z: rayDir.z },
-      hitPoint: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z }
-    });
+    if (this.network) {
+      this.network.broadcastShoot(gunMuzzleWorld, rayDir, hitPoint);
+    }
   }
 
   applyRecoil() {

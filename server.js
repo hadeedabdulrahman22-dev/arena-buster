@@ -14,8 +14,9 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3000;
 
-// Serve static frontend files
+// Serve static frontend files (both public/ and root directory for static & serverless compatibility)
 app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname));
 // Serve local Three.js modules
 app.use('/three', express.static(path.join(__dirname, 'node_modules/three')));
 

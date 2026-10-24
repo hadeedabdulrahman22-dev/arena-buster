@@ -1,70 +1,63 @@
-# 🎮 ARENA BUSTER - 3D Multiplayer FPS Web Game
+# 🎮 ARENA BUSTER - Serverless 3D Multiplayer FPS Web Game
 
-A fast-paced multiplayer 3D first-person shooter web game inspired by **Deadshot.io**, built with **Three.js**, **Node.js**, **Express**, and **Socket.io**.
+A fast-paced multiplayer 3D first-person shooter web game inspired by **Deadshot.io**, built with **Three.js** and **Trystero (WebRTC Peer-to-Peer)**.
+
+**Play 24/7 anywhere with zero backend server required!** Works as a 100% static web app on **GitHub Pages**, **Vercel**, and any static host, while maintaining dual-compatibility with Node.js/Express.
 
 ---
 
-## ⚡ Quick Start
+## ⚡ Instant Play (Serverless WebRTC P2P)
 
-### 1. Start the Server
-Run the following in the project root:
+### Option A: Play on GitHub Pages / Vercel (Recommended)
+1. Open the live deployment link:
+   - **GitHub Pages**: `https://<your-username>.github.io/arena-buster/`
+   - **Vercel**: Deploy with one click or link your GitHub repo for instant static deployment.
+2. Enter your Operative Codename.
+3. The room code defaults to **`GLOBAL-ARENA`** so anyone who clicks **PLAY NOW** joins the same public arena immediately!
+4. **Custom Room Codes**: Want to play privately with friends? Simply type any room name (e.g. `MY-SQUAD-99`) and share the room code with your friends.
+
+### Option B: Local Testing (Dual Compatibility)
+Run locally using Node.js:
 ```bash
 npm start
 ```
-The server will boot and display:
-```
-=========================================
- ARENA BUSTER - Multiplayer FPS Server 
- Running on http://localhost:3000
- Network IP: http://0.0.0.0:3000
-=========================================
-```
-
-### 2. Play with Friends (Local & LAN / Wi-Fi)
-- **On your machine**: Open your web browser to [http://localhost:3000](http://localhost:3000).
-- **For your friends on the same local network**:
-  1. Find your local IP address (e.g. `192.168.1.XX` via `ipconfig` in command prompt).
-  2. Send your friends the link: `http://192.168.1.XX:3000`.
-  3. Enter usernames, choose weapon classes, and jump into the arena together!
+Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ---
 
 ## 🎯 Game Features
 
-### 1. Tactical Lobby UI
-- Clean dark-themed cyberpunk/military interface.
-- Username codename input (with automatic random name generation).
-- Weapon class selection cards with stat bars.
-- Big vibrant blue **PLAY NOW** button.
-- Procedural Web Audio API sound effects toggle.
+### 1. Serverless WebRTC P2P Multiplayer (Trystero)
+- **Zero Server Maintenance**: Uses decentralized WebRTC data channels via lightweight public MQTT broker signaling.
+- **Global Public Matchmaking**: Room defaults to `GLOBAL-ARENA` for instant matchmaking.
+- **Private Match Rooms**: Type any custom room code to battle in private friend lobbies.
+- **Client-Side Authoritative Combat**:
+  - Direct P2P hit verification and damage confirmation.
+  - Floating combat text (`-24`, `-48`, `-160 CRIT!`) and spatial hitmarkers.
+  - 3-second safe respawn at the arena point farthest from active enemies.
+  - Synchronized kill feed announcements and TAB scoreboard.
 
-### 2. 3D Combat Arena
-- Enclosed perimeter walls with industrial textures and hazard trims.
-- Multi-tier vertical gameplay:
-  - **Elevated Sky Bridge Platform**: Central elevated platform with protective half-wall peek covers.
-  - **Incline Ramps**: Smooth slope-climbing ramps leading up to the sky bridge and side terraces.
-  - **Cover Crates**: Single crates, tall stacked double-crates, and barricades for tactical flanking.
-  - **Support Pillars**: Heavy architectural pillars with glowing cyan beacon rings.
-- Atmospheric dynamic skybox with dusk twilight gradient.
-- Atmospheric lighting (sunlight with soft shadows, cool rim light, and colored sci-fi beacons).
+### 2. Tactical Sliding Mechanic
+- **Trigger**: Press `C` or `Ctrl` while moving or sprinting (`Shift + W`).
+- **Physics & Momentum**: Fast initial forward burst of speed that smoothly decays over 0.8 seconds.
+- **Camera & Viewmodel Dynamics**: Smoothly lowers camera eye height (`1.7` down to `0.85`), tilts camera/gun with a tactical roll angle, and plays whoosh audio.
+- **Multiplayer Sync**: Remote players' 3D character models and hitboxes dynamically duck and slide.
 
-### 3. FPS Controls & Shooting
-- **PointerLockControls**: Full mouse-look aiming with centered dynamic crosshair.
-- **WASD + Sprint + Jump**:
-  - `W, A, S, D` / Arrow keys: Movement with realistic momentum and friction.
-  - `Shift`: High-speed sprint.
-  - `Space`: Jump with gravity physics.
-- **Procedural 3D Weapon Models (First-Person Viewmodels)**:
-  - Dynamic walking/sprinting viewmodel bobbing & idle breathing sway.
-  - Recoil animation (camera punch + weapon kicks back and smoothly recovers).
-  - Muzzle flashes & glowing bullet tracers.
-  - Wall impact spark bursts.
-  - Right-Click **Aim Down Sights (ADS)**:
-    - Assault & SMG: Smooth zoom and tightens weapon spread.
-    - Sniper Rifle: Full-screen military sniper scope with illuminated mil-dot reticle.
-  - Reloading (`R`): Animated reload progress bar and sound effects.
+### 3. Automatic Health Regeneration
+- **Regen Logic**: If a player takes no damage for 5 seconds, health automatically regenerates at **+5 HP every 250ms** back to 100 HP.
+- **HUD Healing Animation**: Glowing cyan/green healing pulse effect on the health bar with a smooth numerical counter.
+- **Multiplayer Sync**: Remote overhead billboard health bars smoothly fill up in real time.
 
-### 4. Weapon Classes
+### 4. Centered Crosshair & ADS Precision
+- Dynamic crosshair strictly locked to screen center with radial expansion on recoil.
+- Center dot aligned with NDC `(0, 0)` raycasting for pinpoint accuracy.
+- Right-click Aim Down Sights (ADS) for tighter spread (and full mil-dot sniper scope).
+
+### 5. Full 3D Map & Collision Physics
+- Elevated sky bridge catwalk, smooth slope ramps, crates, pillars, and boundary walls.
+- Full 3D AABB height checks: walk smoothly on top of crates/platforms, walk freely underneath elevated sky bridges, and ascend/descend ramps without invisible walls.
+
+### 6. Weapon Classes
 
 | Class | Damage (Body / Head) | Fire Rate | Mag Size | Range | Special |
 |---|---|---|---|---|---|
@@ -74,43 +67,36 @@ The server will boot and display:
 
 *Headshots deal **2x damage** with distinctive crunch sound and critical hitmarkers!*
 
-### 5. Real-Time Multiplayer State (Socket.io)
-- Real-time position & rotation synchronization with smooth interpolation (lerping).
-- 3D colored humanoid operative models for remote players:
-  - Armor torso and glowing team helmet.
-  - Floating 2D billboard nameplate showing username and live health bar.
-  - Dynamic running leg animations.
-  - Separate **Head** and **Body** hitboxes for 2x headshot damage.
-  - Remote player muzzle flashes, tracers, and distance-attenuated 3D gunshot sounds.
+---
 
-### 6. Health, Elimination & Automatic Respawn
-- **100 HP** with bottom-left animated health bar and low-health danger pulse.
-- **Ammo Counter & Reload Indicator** at bottom-right.
-- **Top-Right Animated Kill Feed**: Shows `[Killer] 🔫 [Victim]` with special `[HEADSHOT]` badge.
-- **Hitmarkers**:
-  - White hitmarker for standard body hits.
-  - Red hitmarker + floating combat damage text (e.g. `-160 CRIT!`) on headshots.
-- **Elimination Overlay**:
-  - When eliminated, player sees "ELIMINATED BY [Killer]".
-  - Automatic **3-second respawn timer** counts down `3... 2... 1...`.
-  - Player automatically respawns at a safe spawn location with full health and ammo!
-- **Scoreboard (`Tab` key)**: Displays all players ranked by score, kills, deaths, and K/D ratio.
-- **In-Game Chat (`Enter` key)**: Real-time text chat with friends while playing.
+## 🎮 Controls
+
+| Key | Action |
+|---|---|
+| `W, A, S, D` | Move operative |
+| `Mouse` | Look / Aim (PointerLock) |
+| `Left Click` | Shoot weapon |
+| `Right Click` | Aim Down Sights (ADS) / Sniper Scope |
+| `Shift` | Tactical Sprint |
+| `C` / `Ctrl` | Tactical Slide |
+| `Space` | Jump |
+| `R` | Reload weapon |
+| `Tab` | Arena Leaderboard / Scoreboard |
+| `Enter` | In-Game Chat |
+| `Esc` | Release mouse cursor |
 
 ---
 
-## ⌨️ Controls Summary
+## 🌐 Deploy to GitHub Pages
 
-| Key / Action | Function |
-|---|---|
-| **W, A, S, D** | Move |
-| **Shift** | Sprint |
-| **Space** | Jump |
-| **Mouse Move** | Aim / Look around |
-| **Left Click** | Fire Weapon |
-| **Right Click** | Aim Down Sights (ADS) / Sniper Scope |
-| **R** | Reload |
-| **1, 2, 3** | Quick-switch weapon class in game |
-| **Tab (Hold)** | Open Leaderboard / Scoreboard |
-| **Enter** | Open Chat / Send Message |
-| **Esc / Click** | Release / Lock Cursor |
+1. In your GitHub repository settings, go to **Pages** (`Settings > Pages`).
+2. Under **Build and deployment > Source**, select **Deploy from a branch**.
+3. Choose branch `main` and folder `/ (root)`.
+4. Click **Save**. Your game will be live at `https://<your-username>.github.io/<repo-name>/`!
+
+## 🚀 Deploy to Vercel
+
+1. Import your GitHub repository in the [Vercel Dashboard](https://vercel.com).
+2. Framework Preset: **Other** (Static Site).
+3. Root Directory: `./`
+4. Click **Deploy**. Vercel will build and serve it immediately on a high-speed global edge network!

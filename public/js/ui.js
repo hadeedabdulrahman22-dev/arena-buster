@@ -12,6 +12,7 @@ export class UIManager {
     // Lobby elements
     this.lobbyOverlay = document.getElementById('lobby-overlay');
     this.usernameInput = document.getElementById('username-input');
+    this.roomInput = document.getElementById('room-input');
     this.playBtn = document.getElementById('play-btn');
     this.weaponCards = document.querySelectorAll('.weapon-select-card');
     this.selectedWeaponClass = 'assault';
@@ -92,13 +93,16 @@ export class UIManager {
   onPlayClicked(callback) {
     this.playBtn.addEventListener('click', () => {
       const username = this.usernameInput.value.trim() || 'Operative';
+      const rawRoom = this.roomInput ? this.roomInput.value.trim() : '';
+      const roomId = (rawRoom || 'GLOBAL-ARENA').toUpperCase();
       audio.init();
       audio.ensureContext();
       this.lobbyOverlay.classList.add('hidden');
       this.hudOverlay.classList.remove('hidden');
       callback({
         username,
-        weaponClass: this.selectedWeaponClass
+        weaponClass: this.selectedWeaponClass,
+        roomId
       });
     });
   }
