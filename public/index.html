@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>ARENA BUSTER - Multiplayer 3D FPS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/three/build/three.module.js",
+      "three/addons/": "/three/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <!-- 3D WebGL Canvas -->
+  <canvas id="game-canvas"></canvas>
+
+  <!-- LOBBY OVERLAY -->
+  <div id="lobby-overlay" class="overlay-screen">
+    <div class="lobby-container">
+      <div class="lobby-header">
+        <h1 class="game-title">ARENA BUSTER</h1>
+        <div class="game-subtitle">Fast-Paced 3D Multiplayer Arena Shooter</div>
+      </div>
+
+      <!-- Player Username Configuration -->
+      <div class="player-config">
+        <label class="input-label" for="username-input">OPERATIVE CODENAME</label>
+        <input type="text" id="username-input" class="tactical-input" placeholder="Enter username..." maxlength="16" autocomplete="off" spellcheck="false">
+      </div>
+
+      <!-- Weapon Class Selection -->
+      <div class="class-selector-section">
+        <label class="section-label">CHOOSE WEAPON LOADOUT</label>
+        <div class="weapon-cards-grid">
+          
+          <!-- Assault Rifle Card -->
+          <div class="weapon-select-card selected" data-weapon="assault">
+            <div class="card-icon">⚡</div>
+            <div class="card-title">Assault Rifle</div>
+            <div class="card-type">Full-Auto Rifle</div>
+            <div class="card-stats">
+              <div class="stat-row">
+                <span>DAMAGE</span>
+                <div class="stat-bar-bg"><div class="stat-bar-fill" style="width: 60%;"></div></div>
+              </div>
+              <div class="stat-row">
+                <span>FIRE RATE</span>
+                <div class="stat-bar-bg"><div class="stat-bar-fill" style="width: 70%;"></div></div>
+              </div>
+              <div class="stat-row">
+                <span>RANGE</span>
+                <div class="stat-bar-bg"><div class="stat-bar-fill" style="width: 75%;"></div></div>
+              </div>
+              <div class="stat-row">
+                <span>MAGAZINE</span>
+                <span style="color: #00f0ff; font-weight: bold;">30</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- SMG Card -->
+          <div class="weapon-select-card" data-weapon="smg">
+            <div class="card-icon">💥</div>
+            <div class="card-title">SMG Vector</div>
+            <div class="card-type">Rapid Submachine</div>
+            <div class="card-stats">
+              <div class="stat-row">
+                <span>DAMAGE</span>
+                <div class="stat-bar-bg"><div class="stat-bar-fill" style="width: 45%;"></div></div>
+              </div>
+              <div class="stat-row">
+                <span>FIRE RATE</span>
+                <div class="stat-bar-bg"><div class="stat-bar-fill" style="width: 95%;"></div></div>
+              </div>
+              <div class="stat-row">
+                <span>RANGE</span>
+                <div class="stat-bar-bg"><div class="stat-bar-fill" style="width: 45%;"></div></div>
+              </div>
+              <div class="stat-row">
+                <span>MAGAZINE</span>
+                <span style="color: #00f0ff; font-weight: bold;">35</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Sniper Rifle Card -->
+          <div class="weapon-select-card" data-weapon="sniper">
+            <div class="card-icon">🎯</div>
+            <div class="card-title">Heavy Sniper</div>
+            <div class="card-type">Bolt-Action Precision</div>
+            <div class="card-stats">
+              <div class="stat-row">
+                <span>DAMAGE</span>
+                <div class="stat-bar-bg"><div class="stat-bar-fill" style="width: 100%; background: #ff0055;"></div></div>
+              </div>
+              <div class="stat-row">
+                <span>FIRE RATE</span>
+                <div class="stat-bar-bg"><div class="stat-bar-fill" style="width: 25%;"></div></div>
+              </div>
+              <div class="stat-row">
+                <span>RANGE</span>
+                <div class="stat-bar-bg"><div class="stat-bar-fill" style="width: 100%;"></div></div>
+              </div>
+              <div class="stat-row">
+                <span>MAGAZINE</span>
+                <span style="color: #00f0ff; font-weight: bold;">5</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Big Blue PLAY Button -->
+      <div class="play-btn-container">
+        <button id="play-btn" class="big-blue-play-btn">PLAY NOW</button>
+      </div>
+
+      <!-- Footer Info -->
+      <div class="lobby-footer">
+        <div class="controls-hint">
+          <span>WASD</span> Move | <span>SHIFT</span> Sprint | <span>C / CTRL</span> Slide | <span>SPACE</span> Jump | <span>L-CLICK</span> Shoot | <span>R-CLICK</span> Scope | <span>R</span> Reload | <span>TAB</span> Scoreboard
+        </div>
+        <button id="audio-toggle-btn" class="btn-secondary">🔊 Audio: ON</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- IN-GAME HUD OVERLAY -->
+  <div id="hud-overlay" class="hidden">
+    <!-- Dynamic Centered Crosshair -->
+    <div id="crosshair">
+      <div class="ch-line ch-top"></div>
+      <div class="ch-line ch-bottom"></div>
+      <div class="ch-line ch-left"></div>
+      <div class="ch-line ch-right"></div>
+      <div class="ch-dot"></div>
+    </div>
+
+    <!-- Sniper Scope Overlay -->
+    <div id="sniper-scope" class="hidden">
+      <div class="scope-reticle">
+        <div class="scope-line-v"></div>
+        <div class="scope-line-h"></div>
+        <div class="scope-center-dot"></div>
+      </div>
+    </div>
+
+    <!-- Hitmarker Indicator -->
+    <div id="hitmarker" class="hidden">
+      <div class="hm-tick hm-tl"></div>
+      <div class="hm-tick hm-tr"></div>
+      <div class="hm-tick hm-bl"></div>
+      <div class="hm-tick hm-br"></div>
+    </div>
+
+    <!-- Damage Screen Flash Vignette -->
+    <div id="damage-flash" class="hidden"></div>
+
+    <!-- Floating Damage Numbers Container -->
+    <div id="floating-damage-container"></div>
+
+    <!-- Kill Banner Pop -->
+    <div id="kill-banner" class="hidden"></div>
+
+    <!-- Kill Feed (Top Right) -->
+    <div id="kill-feed"></div>
+
+    <!-- Bottom Left: Health -->
+    <div class="hud-bottom-left">
+      <div class="health-header">
+        <span class="hud-label">HEALTH</span>
+        <span id="health-val" class="health-val">100</span>
+      </div>
+      <div class="health-bar-container">
+        <div id="health-fill" class="health-bar-fill"></div>
+      </div>
+    </div>
+
+    <!-- Bottom Center: Active Weapon -->
+    <div class="hud-bottom-center">
+      <div id="hud-weapon-name" class="hud-weapon-name">ASSAULT RIFLE</div>
+      <div id="hud-weapon-type" class="hud-weapon-type">FULL-AUTO RIFLE</div>
+    </div>
+
+    <!-- Bottom Right: Ammo & Reload -->
+    <div class="hud-bottom-right">
+      <div class="hud-label" style="margin-bottom: 2px;">AMMUNITION</div>
+      <div class="ammo-display">
+        <span id="ammo-current" class="ammo-current">30</span>
+        <span class="ammo-divider">/</span>
+        <span id="ammo-max" class="ammo-max">30</span>
+      </div>
+      <div id="reload-prompt" class="reload-prompt hidden">PRESS [R] TO RELOAD</div>
+      <div class="reload-progress-container">
+        <div id="reload-progress-bar" class="reload-progress-bar"></div>
+      </div>
+    </div>
+
+    <!-- Chat Overlay -->
+    <div id="chat-container">
+      <div id="chat-messages"></div>
+      <input type="text" id="chat-input" placeholder="Press Enter to chat..." maxlength="100">
+    </div>
+  </div>
+
+  <!-- SCOREBOARD OVERLAY (Tab key) -->
+  <div id="scoreboard-overlay" class="hidden">
+    <div class="scoreboard-container">
+      <h2 class="scoreboard-title">ARENA LEADERBOARD</h2>
+      <table class="scoreboard-table">
+        <thead>
+          <tr>
+            <th>RANK</th>
+            <th>OPERATIVE</th>
+            <th>KILLS</th>
+            <th>DEATHS</th>
+            <th>K/D</th>
+            <th>SCORE</th>
+          </tr>
+        </thead>
+        <tbody id="scoreboard-table-body">
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ELIMINATION / RESPAWN OVERLAY -->
+  <div id="elimination-overlay" class="hidden">
+    <div class="elim-box">
+      <h2 class="elim-title">ELIMINATED</h2>
+      <div class="elim-details">
+        Killed by <span id="elim-killer-name" class="elim-killer-name">Enemy</span>
+        <span id="elim-headshot-badge" class="elim-headshot-badge hidden">HEADSHOT</span>
+      </div>
+      <div class="respawn-timer-label">RESPAWNING IN</div>
+      <div id="elim-countdown" class="respawn-countdown">3</div>
+    </div>
+  </div>
+
+  <!-- Socket.io client -->
+  <script src="/socket.io/socket.io.js"></script>
+
+  <!-- Game entrypoint -->
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
