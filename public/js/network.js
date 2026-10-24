@@ -287,8 +287,11 @@ export class NetworkManager {
     if (!payload) return;
     const peerId = payload.peerId || payload.id || fallbackPeerId;
 
-    // If packet.peerId === this.myId, ignore it completely!
-    if (!peerId || peerId === this.myId) return;
+    // Ensure that your own local player ID (this.myId) is NEVER processed or added as a remote player
+    if (!peerId) return;
+    if (peerId === this.myId || peerId === this.selfId || payload.peerId === this.myId || payload.id === this.myId) {
+      return;
+    }
 
     switch (type) {
       case 'profile':
@@ -324,41 +327,66 @@ export class NetworkManager {
     }
   }
 
+  createRemotePlayer(peerId, data) {
+    if (!peerId) return null;
+    // Strictly ensure own player ID is NEVER added to remotePlayers and NEVER triggers character creation
+    if (peerId === this.myId || peerId === this.selfId) return null;
+    if (data?.peerId === this.myId || data?.id === this.myId) return null;
+
+    // Strictly check: if (this.remotePlayers[peerId]) { return this.remotePlayers[peerId]; }
+    // If the player already exists in the dictionary, NEVER instantiate a new THREE.Group() or call scene.add().
+    if (this.remotePlayers[peerId]) {
+      return this.remotePlayers[peerId];
+    }
+
+    const remote = new RemotePlayer({
+      id: peerId,
+      username: data?.username || 'Operative',
+      color: data?.color || '#00f0ff',
+      weaponClass: data?.weaponClass || 'assault',
+      health: data?.health ?? 100,
+      isAlive: data?.isAlive !== false,
+      position: data?.position || { x: 0, y: 0, z: 0 }
+    }, this.scene);
+
+    remote.lastSeen = Date.now();
+    this.remotePlayers[peerId] = remote;
+    this.rebuildHitboxCache();
+    this.updateOnlineCount();
+
+    if (!this.announcedPeers.has(peerId)) {
+      this.announcedPeers.add(peerId);
+      this.ui.addKillFeedMessage(`${data?.username || 'Operative'} joined the arena`, 'system');
+    }
+
+    return remote;
+  }
+
+  addRemotePlayer(data) {
+    const peerId = data?.id || data?.peerId;
+    return this.createRemotePlayer(peerId, data);
+  }
+
   onReceiveProfile(profile, peerId) {
-    if (!profile || !peerId || peerId === this.myId) return;
+    if (!profile || !peerId) return;
+    if (peerId === this.myId || peerId === this.selfId || profile.peerId === this.myId || profile.id === this.myId) {
+      return;
+    }
 
     let remote = this.remotePlayers[peerId];
     if (!remote) {
-      remote = new RemotePlayer({
-        id: peerId,
-        username: profile.username || 'Operative',
-        color: profile.color || '#00f0ff',
-        weaponClass: profile.weaponClass || 'assault',
-        health: profile.health ?? 100,
-        isAlive: profile.isAlive ?? true,
-        position: profile.position || { x: 0, y: 0, z: 0 }
-      }, this.scene);
-      remote.lastSeen = Date.now();
-      this.remotePlayers[peerId] = remote;
-      this.rebuildHitboxCache();
-      this.updateOnlineCount();
-
-      if (!this.announcedPeers.has(peerId)) {
-        this.announcedPeers.add(peerId);
-        this.ui.addKillFeedMessage(`${profile.username || 'Operative'} joined the arena`, 'system');
-      }
-
-      // Return handshake profile directly to this peer
+      remote = this.createRemotePlayer(peerId, profile);
+      if (!remote) return;
       this.sendSelfProfile(peerId);
-    } else {
-      remote.lastSeen = Date.now();
-      if (profile.username) remote.username = profile.username;
-      if (profile.weaponClass && profile.weaponClass !== remote.weaponClass) {
-        remote.changeWeapon(profile.weaponClass);
-      }
-      if (typeof profile.health === 'number') {
-        remote.updateHealth(profile.health, 100);
-      }
+    }
+
+    remote.lastSeen = Date.now();
+    if (profile.username) remote.username = profile.username;
+    if (profile.weaponClass && profile.weaponClass !== remote.weaponClass) {
+      remote.changeWeapon(profile.weaponClass);
+    }
+    if (typeof profile.health === 'number') {
+      remote.updateHealth(profile.health, 100);
     }
 
     this.ui.updateScoreboardEntry({
@@ -372,37 +400,21 @@ export class NetworkManager {
   }
 
   onReceiveState(data, peerId) {
-    if (!data || !peerId || peerId === this.myId) return;
+    if (!data || !peerId) return;
+    if (peerId === this.myId || peerId === this.selfId || data.peerId === this.myId || data.id === this.myId) {
+      return;
+    }
 
+    // Strictly check: if not in dictionary, create ONCE.
+    // If the player already exists in the dictionary, NEVER instantiate a new THREE.Group or call scene.add()!
     let remote = this.remotePlayers[peerId];
-
-    // Maintain a single dictionary this.remotePlayers = {} keyed strictly by packet.peerId.
-    // If this.remotePlayers[packet.peerId] ALREADY exists, NEVER create a new THREE.Group or add a new mesh to this.scene!
     if (!remote) {
-      remote = new RemotePlayer({
-        id: peerId,
-        username: data.username || 'Operative',
-        color: data.color || '#00f0ff',
-        weaponClass: data.weaponClass || 'assault',
-        health: data.health ?? 100,
-        isAlive: data.isAlive !== false,
-        position: data.position || { x: 0, y: 0, z: 0 }
-      }, this.scene);
-      remote.lastSeen = Date.now();
-      this.remotePlayers[peerId] = remote;
-      this.rebuildHitboxCache();
-      this.updateOnlineCount();
-
-      if (!this.announcedPeers.has(peerId)) {
-        this.announcedPeers.add(peerId);
-        this.ui.addKillFeedMessage(`${data.username || 'Operative'} joined the arena`, 'system');
-      }
-
-      // Return handshake profile
+      remote = this.createRemotePlayer(peerId, data);
+      if (!remote) return;
       this.sendSelfProfile(peerId);
     }
 
-    // ONLY update existing character's position, rotation, and animation
+    // Only update the existing mesh's target position and rotation
     remote.lastSeen = Date.now();
 
     if (data.position) {

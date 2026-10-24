@@ -722,6 +722,8 @@ export class LocalPlayer {
     if (this.network) {
       const camEuler = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ');
       this.network.sendPlayerState({
+        peerId: this.network.myId,
+        id: this.network.myId,
         position: {
           x: this.camera.position.x,
           y: this.camera.position.y - this.eyeHeight,
