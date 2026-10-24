@@ -80,6 +80,12 @@ export class NetworkManager {
     // Peer joined announcement tracker
     this.announcedPeers = new Set();
 
+    // Native browser BroadcastChannel for 0ms multi-tab synchronization on same PC
+    this.broadcastChannel = null;
+
+    // Recent message IDs cache for deduplication between BroadcastChannel & WebRTC
+    this.recentMsgIds = new Set();
+
     // P2P Room instance & action handles
     this.room = null;
     this.sendProfile = null;
@@ -104,6 +110,10 @@ export class NetworkManager {
     // Throttled network packet sender
     this.lastSent = 0;
     this.sendRateMs = 50; // 50ms (~20Hz) broadcast loop
+
+    // Continuous heartbeat & background broadcast interval
+    this.broadcastInterval = null;
+    this.lastHeartbeatTime = 0;
 
     // Client-side automatic health regeneration tracking
     this.lastDamageTime = 0;
@@ -132,338 +142,508 @@ export class NetworkManager {
     this.updateScoreboardSelf();
     this.updateOnlineCount();
 
-    // Join Trystero decentralized WebRTC room via WebTorrent trackers
-    const appId = 'arena-buster-p2p-fps';
-    this.room = joinRoom({ appId }, this.roomId);
-
-    // Register Trystero action channels
-    [this.sendProfile, this.getProfile] = this.room.makeAction('profile');
-    [this.sendState, this.getState] = this.room.makeAction('state');
-    [this.sendShoot, this.getShoot] = this.room.makeAction('shoot');
-    [this.sendHit, this.getHit] = this.room.makeAction('hit');
-    [this.sendDamageConfirm, this.getDamageConfirm] = this.room.makeAction('damageConfirm');
-    [this.sendHealthUpdate, this.getHealthUpdate] = this.room.makeAction('healthUpdate');
-    [this.sendKill, this.getKill] = this.room.makeAction('kill');
-    [this.sendRespawn, this.getRespawn] = this.room.makeAction('respawn');
-    [this.sendChat, this.getChat] = this.room.makeAction('chat');
-
-    // 1. Handle new peer connections
-    this.room.onPeerJoin((peerId) => {
-      console.log(`[P2P Network] Peer joined room: ${peerId}`);
-      // Send self profile and current location to joining peer immediately
-      this.sendSelfProfile(peerId);
-      this.sendCurrentState(peerId);
-      this.updateOnlineCount();
-    });
-
-    // 2. Handle peer disconnections
-    this.room.onPeerLeave((peerId) => {
-      console.log(`[P2P Network] Peer left room: ${peerId}`);
-      const remote = this.remotePlayers.get(peerId);
-      if (remote) {
-        this.ui.addKillFeedMessage(`${remote.username} left the arena`, 'system');
-      }
-      this.removeRemotePlayer(peerId);
-      this.announcedPeers.delete(peerId);
-      this.updateOnlineCount();
-    });
-
-    // 3. Receive peer profiles
-    this.getProfile((profile, peerId) => {
-      if (!profile || peerId === this.selfId) return;
-
-      if (!this.remotePlayers.has(peerId)) {
-        this.addRemotePlayer({
-          id: peerId,
-          username: profile.username || 'Operative',
-          color: profile.color || '#00f0ff',
-          weaponClass: profile.weaponClass || 'assault',
-          health: profile.health ?? 100,
-          isAlive: profile.isAlive ?? true,
-          position: profile.position || { x: 0, y: 0, z: 0 }
-        });
-
-        if (!this.announcedPeers.has(peerId)) {
-          this.announcedPeers.add(peerId);
-          this.ui.addKillFeedMessage(`${profile.username} joined the arena`, 'system');
+    // 1. Setup high-speed native BroadcastChannel for instant same-browser multi-tab sync (0ms latency)
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        if (this.broadcastChannel) {
+          this.broadcastChannel.close();
         }
+        this.broadcastChannel = new BroadcastChannel('arena-buster-' + this.roomId);
+        this.broadcastChannel.onmessage = (event) => {
+          if (!event.data) return;
+          const { type, senderId, targetId, msgId, payload } = event.data;
+          if (!senderId || senderId === this.selfId) return;
+          if (targetId && targetId !== this.selfId) return;
 
-        // Return hand-shake profile
-        this.sendSelfProfile(peerId);
-      } else {
-        const remote = this.remotePlayers.get(peerId);
-        if (remote) {
-          remote.username = profile.username;
-          if (profile.weaponClass && profile.weaponClass !== remote.weaponClass) {
-            remote.changeWeapon(profile.weaponClass);
+          // Message deduplication
+          if (msgId && this.hasSeenMessage(msgId)) return;
+
+          this.handleIncomingPacket(type, payload, senderId);
+        };
+
+        // Notify other tabs immediately on page unload
+        window.addEventListener('beforeunload', () => {
+          if (this.broadcastChannel) {
+            try {
+              this.broadcastChannel.postMessage({
+                type: 'leave',
+                senderId: this.selfId
+              });
+            } catch (_) {}
           }
-          if (typeof profile.health === 'number') {
-            remote.updateHealth(profile.health, 100);
-          }
-        }
-      }
-
-      this.updateOnlineCount();
-
-      this.ui.updateScoreboardEntry({
-        id: peerId,
-        username: profile.username || 'Operative',
-        color: profile.color || '#00f0ff',
-        kills: profile.kills || 0,
-        deaths: profile.deaths || 0,
-        score: profile.score || 0
-      });
-    });
-
-    // 4. Continuous state updates (~20Hz / 50ms)
-    this.getState((data, peerId) => {
-      if (!data || peerId === this.selfId) return;
-
-      let remote = this.remotePlayers.get(peerId);
-      // Auto-create remote 3D player mesh inside onState if remotePlayers[peerId] doesn't exist yet!
-      if (!remote) {
-        this.addRemotePlayer({
-          id: peerId,
-          username: data.username || 'Operative',
-          color: data.color || '#00f0ff',
-          weaponClass: data.weaponClass || 'assault',
-          health: data.health ?? 100,
-          isAlive: data.isAlive !== false,
-          position: data.position || { x: 0, y: 0, z: 0 }
         });
-        remote = this.remotePlayers.get(peerId);
+      }
+    } catch (err) {
+      console.warn('[P2P Network] BroadcastChannel not supported:', err);
+    }
 
-        if (!this.announcedPeers.has(peerId)) {
-          this.announcedPeers.add(peerId);
-          this.ui.addKillFeedMessage(`${data.username || 'Operative'} joined the arena`, 'system');
-        }
+    // 2. Join Trystero decentralized WebRTC room via WebTorrent trackers for internet peers
+    try {
+      const appId = 'arena-buster-p2p-fps';
+      this.room = joinRoom({ appId }, this.roomId);
 
-        // Return hand-shake profile
+      // Register Trystero action channels
+      [this.sendProfile, this.getProfile] = this.room.makeAction('profile');
+      [this.sendState, this.getState] = this.room.makeAction('state');
+      [this.sendShoot, this.getShoot] = this.room.makeAction('shoot');
+      [this.sendHit, this.getHit] = this.room.makeAction('hit');
+      [this.sendDamageConfirm, this.getDamageConfirm] = this.room.makeAction('damageConfirm');
+      [this.sendHealthUpdate, this.getHealthUpdate] = this.room.makeAction('healthUpdate');
+      [this.sendKill, this.getKill] = this.room.makeAction('kill');
+      [this.sendRespawn, this.getRespawn] = this.room.makeAction('respawn');
+      [this.sendChat, this.getChat] = this.room.makeAction('chat');
+
+      // Handle new peer connections via WebRTC
+      this.room.onPeerJoin((peerId) => {
+        console.log(`[P2P Network] WebRTC Peer joined room: ${peerId}`);
         this.sendSelfProfile(peerId);
+        this.sendCurrentState(peerId);
         this.updateOnlineCount();
-      }
-
-      if (remote) {
-        if (data.position) {
-          remote.targetPosition.set(data.position.x, data.position.y, data.position.z);
-        }
-        if (data.rotation) {
-          remote.targetRotation.yaw = data.rotation.yaw ?? 0;
-          remote.targetRotation.pitch = data.rotation.pitch ?? 0;
-        }
-        remote.isSprinting = !!data.isSprinting;
-        remote.isSliding = !!data.isSliding;
-
-        // Slide direction sync
-        if (remote.isSliding) {
-          if (typeof data.slideYaw === 'number') {
-            remote.slideYaw = data.slideYaw;
-          } else if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number' && (data.slideDirX !== 0 || data.slideDirZ !== 0)) {
-            remote.slideYaw = Math.atan2(-data.slideDirX, -data.slideDirZ);
-          }
-          if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number') {
-            remote.slideDir.set(data.slideDirX, data.slideDirZ);
-          }
-        }
-
-        remote.isAlive = data.isAlive !== false;
-
-        if (typeof data.health === 'number') {
-          remote.updateHealth(data.health, 100);
-        }
-
-        if (data.weaponClass && data.weaponClass !== remote.weaponClass) {
-          remote.changeWeapon(data.weaponClass);
-        }
-      }
-
-        if (typeof data.health === 'number') {
-          remote.updateHealth(data.health, 100);
-        }
-
-        if (data.weaponClass && data.weaponClass !== remote.weaponClass) {
-          remote.changeWeapon(data.weaponClass);
-        }
-      }
-
-      if (data.kills !== undefined || data.deaths !== undefined || data.score !== undefined) {
-        this.ui.updateScoreboardEntry({
-          id: peerId,
-          username: data.username || remote?.username || 'Operative',
-          color: data.color || remote?.color || '#00f0ff',
-          kills: data.kills || 0,
-          deaths: data.deaths || 0,
-          score: data.score || 0
-        });
-      }
-    });
-
-    // 5. Remote player shooting visual & sound
-    this.getShoot((data, peerId) => {
-      if (!data || peerId === this.selfId) return;
-
-      const remote = this.remotePlayers.get(peerId);
-      const origin = new THREE.Vector3(data.origin.x, data.origin.y, data.origin.z);
-      const hitPoint = new THREE.Vector3(data.hitPoint.x, data.hitPoint.y, data.hitPoint.z);
-
-      if (remote) {
-        remote.triggerMuzzleFlash();
-      }
-
-      // Distance audio attenuation
-      const dist = this.camera.position.distanceTo(origin);
-      audio.playGunshot(data.weaponClass || 'assault', true, dist);
-
-      // Render 3D bullet tracer line
-      this.spawnTracer(origin, hitPoint);
-    });
-
-    // 6. Direct Hit Registration (sent to local player from attacker)
-    this.getHit((data, peerId) => {
-      if (!data || !this.localPlayerRef || !this.localPlayerRef.isAlive) return;
-
-      const damage = data.damage || 20;
-      const isHeadshot = !!data.isHeadshot;
-      const hitPoint = data.hitPoint || { x: this.camera.position.x, y: this.camera.position.y, z: this.camera.position.z };
-
-      // Deduct health locally
-      this.localPlayerRef.health = Math.max(0, this.localPlayerRef.health - damage);
-      this.lastDamageTime = Date.now();
-      this.isRegenerating = false;
-
-      // Audio & visual feedback on hit
-      audio.playDamageTaken();
-      this.ui.triggerDamageFlash();
-      this.ui.updateHealth(this.localPlayerRef.health, 100, false);
-
-      // Send damage confirmation directly back to the attacker
-      this.sendDamageConfirm({
-        damage,
-        isHeadshot,
-        hitPoint,
-        remainingHealth: this.localPlayerRef.health,
-        victimId: this.selfId
-      }, peerId);
-
-      // Broadcast health update to room for overhead health bars
-      this.sendHealthUpdate({
-        playerId: this.selfId,
-        health: this.localPlayerRef.health,
-        maxHealth: 100,
-        isRegenerating: false
       });
 
-      // Handle elimination
-      if (this.localPlayerRef.health <= 0) {
-        this.localPlayerRef.isAlive = false;
-        this.localPlayerRef.isADS = false;
-        this.ui.setAds(false, false);
-        this.deaths += 1;
-        this.updateScoreboardSelf();
+      // Handle peer disconnections via WebRTC
+      this.room.onPeerLeave((peerId) => {
+        console.log(`[P2P Network] WebRTC Peer left room: ${peerId}`);
+        this.onReceiveLeave(peerId);
+      });
 
-        // Broadcast elimination event to all peers
-        this.sendKill({
-          killerId: data.attackerId,
-          killerName: data.attackerName || 'Enemy',
-          victimId: this.selfId,
-          victimName: this.username,
-          weaponClass: data.weaponClass || 'assault',
-          isHeadshot
-        });
+      // Bind Trystero incoming actions to unified packet handler
+      this.getProfile((data, peerId) => this.handleIncomingPacket('profile', data, peerId));
+      this.getState((data, peerId) => this.handleIncomingPacket('state', data, peerId));
+      this.getShoot((data, peerId) => this.handleIncomingPacket('shoot', data, peerId));
+      this.getHit((data, peerId) => this.handleIncomingPacket('hit', data, peerId));
+      this.getDamageConfirm((data, peerId) => this.handleIncomingPacket('damageConfirm', data, peerId));
+      this.getHealthUpdate((data, peerId) => this.handleIncomingPacket('healthUpdate', data, peerId));
+      this.getKill((data, peerId) => this.handleIncomingPacket('kill', data, peerId));
+      this.getRespawn((data, peerId) => this.handleIncomingPacket('respawn', data, peerId));
+      this.getChat((data, peerId) => this.handleIncomingPacket('chat', data, peerId));
+    } catch (err) {
+      console.warn('[P2P Network] WebRTC room error:', err);
+    }
 
-        // Local elimination UI & sound
-        audio.playElimination();
-        this.ui.showEliminationScreen(data.attackerName || 'Enemy', isHeadshot, 3000);
+    // Broadcast our profile immediately so all local and remote peers discover us
+    this.sendSelfProfile();
+    this.sendCurrentState();
 
-        // Client-side 3-second safe auto-respawn
-        setTimeout(() => {
-          const respawnPoint = getSafeSpawnPoint(this.remotePlayers);
-          this.localPlayerRef.health = 100;
-          this.localPlayerRef.isAlive = true;
-          this.lastDamageTime = 0;
-          this.isRegenerating = false;
-          this.localPlayerRef.respawn(respawnPoint, 100);
+    // 3. Dedicated Background setInterval: continues broadcasting even when tab is blurred/backgrounded
+    if (this.broadcastInterval) clearInterval(this.broadcastInterval);
+    this.broadcastInterval = setInterval(() => {
+      this.broadcastHeartbeatAndState();
+    }, 80);
 
-          // Broadcast respawn event to all peers
-          this.sendRespawn({
-            id: this.selfId,
-            position: respawnPoint,
-            health: 100
-          });
-        }, 3000);
-      }
-    });
-
-    // 7. Damage Confirmation (received by attacker when target takes damage)
-    this.getDamageConfirm((data) => {
-      if (!data) return;
-      audio.playHitmarker(data.isHeadshot);
-      this.ui.showHitmarker(data.isHeadshot);
-      if (data.hitPoint) {
-        this.ui.spawnFloatingDamage(data.hitPoint, data.damage, data.isHeadshot, this.camera);
-      }
-    });
-
-    // 8. Overhead Health Updates
-    this.getHealthUpdate((data, peerId) => {
-      if (!data) return;
-      const targetId = data.playerId || peerId;
-      if (targetId === this.selfId) return;
-
-      const remote = this.remotePlayers.get(targetId);
-      if (remote) {
-        remote.updateHealth(data.health, data.maxHealth || 100);
-      }
-    });
-
-    // 9. Kill announcements
-    this.getKill((data) => {
-      if (!data) return;
-
-      this.ui.addKillFeedKill(data.killerName, data.victimName, data.weaponClass, data.isHeadshot);
-
-      // If local player was the killer
-      if (data.killerId === this.selfId) {
-        this.kills += 1;
-        this.score += data.isHeadshot ? 150 : 100;
-        audio.playKillConfirmed();
-        this.ui.showKillBanner(data.victimName, data.isHeadshot);
-        this.updateScoreboardSelf();
-      }
-
-      // If victim was a remote player
-      if (data.victimId !== this.selfId) {
-        const remote = this.remotePlayers.get(data.victimId);
-        if (remote) {
-          remote.onEliminated();
-        }
-      }
-    });
-
-    // 10. Remote Player Respawn
-    this.getRespawn((data, peerId) => {
-      if (!data) return;
-      const targetId = data.id || peerId;
-      if (targetId === this.selfId) return;
-
-      const remote = this.remotePlayers.get(targetId);
-      if (remote && data.position) {
-        remote.onRespawn(data.position);
-      }
-    });
-
-    // 11. In-game text chat
-    this.getChat((data) => {
-      if (!data) return;
-      this.ui.addChatMessage(data.sender, data.color, data.text);
-    });
-
-    this.ui.addKillFeedMessage(`Connected to room: [${this.roomId}]`, 'system');
+    this.ui.addKillFeedMessage(`Joined arena: [${this.roomId}]`, 'system');
     if (onConnected) onConnected();
   }
 
+  // Deduplicate messages received across both BroadcastChannel and WebRTC
+  hasSeenMessage(msgId) {
+    if (!msgId) return false;
+    if (this.recentMsgIds.has(msgId)) return true;
+    this.recentMsgIds.add(msgId);
+    if (this.recentMsgIds.size > 250) {
+      const first = this.recentMsgIds.values().next().value;
+      this.recentMsgIds.delete(first);
+    }
+    return false;
+  }
+
+  // Dual-transport broadcast: sends via BroadcastChannel (local tabs) AND Trystero (internet peers)
+  broadcastPacket(type, payload, targetPeerId = null, msgId = null) {
+    // 1. Send via local browser BroadcastChannel (0ms latency)
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.postMessage({
+          type,
+          senderId: this.selfId,
+          targetId: targetPeerId,
+          msgId,
+          payload
+        });
+      } catch (err) {
+        console.warn('[BroadcastChannel error]', err);
+      }
+    }
+
+    // 2. Send via WebRTC data channel
+    switch (type) {
+      case 'profile':
+        if (this.sendProfile) {
+          if (targetPeerId) this.sendProfile(payload, targetPeerId);
+          else this.sendProfile(payload);
+        }
+        break;
+      case 'state':
+        if (this.sendState) {
+          if (targetPeerId) this.sendState(payload, targetPeerId);
+          else this.sendState(payload);
+        }
+        break;
+      case 'shoot':
+        if (this.sendShoot) this.sendShoot(payload);
+        break;
+      case 'hit':
+        if (this.sendHit && targetPeerId) this.sendHit(payload, targetPeerId);
+        break;
+      case 'damageConfirm':
+        if (this.sendDamageConfirm && targetPeerId) this.sendDamageConfirm(payload, targetPeerId);
+        break;
+      case 'healthUpdate':
+        if (this.sendHealthUpdate) this.sendHealthUpdate(payload);
+        break;
+      case 'kill':
+        if (this.sendKill) this.sendKill(payload);
+        break;
+      case 'respawn':
+        if (this.sendRespawn) this.sendRespawn(payload);
+        break;
+      case 'chat':
+        if (this.sendChat) this.sendChat(payload);
+        break;
+    }
+  }
+
+  // Unified incoming packet router
+  handleIncomingPacket(type, payload, peerId) {
+    if (!peerId || peerId === this.selfId) return;
+
+    switch (type) {
+      case 'profile':
+        this.onReceiveProfile(payload, peerId);
+        break;
+      case 'state':
+        this.onReceiveState(payload, peerId);
+        break;
+      case 'shoot':
+        this.onReceiveShoot(payload, peerId);
+        break;
+      case 'hit':
+        this.onReceiveHit(payload, peerId);
+        break;
+      case 'damageConfirm':
+        this.onReceiveDamageConfirm(payload, peerId);
+        break;
+      case 'healthUpdate':
+        this.onReceiveHealthUpdate(payload, peerId);
+        break;
+      case 'kill':
+        this.onReceiveKill(payload, peerId);
+        break;
+      case 'respawn':
+        this.onReceiveRespawn(payload, peerId);
+        break;
+      case 'chat':
+        this.onReceiveChat(payload, peerId);
+        break;
+      case 'leave':
+        this.onReceiveLeave(peerId);
+        break;
+    }
+  }
+
+  onReceiveProfile(profile, peerId) {
+    if (!profile) return;
+
+    if (!this.remotePlayers.has(peerId)) {
+      this.addRemotePlayer({
+        id: peerId,
+        username: profile.username || 'Operative',
+        color: profile.color || '#00f0ff',
+        weaponClass: profile.weaponClass || 'assault',
+        health: profile.health ?? 100,
+        isAlive: profile.isAlive ?? true,
+        position: profile.position || { x: 0, y: 0, z: 0 }
+      });
+
+      if (!this.announcedPeers.has(peerId)) {
+        this.announcedPeers.add(peerId);
+        this.ui.addKillFeedMessage(`${profile.username || 'Operative'} joined the arena`, 'system');
+      }
+
+      // Return handshake profile directly to this peer
+      this.sendSelfProfile(peerId);
+    } else {
+      const remote = this.remotePlayers.get(peerId);
+      if (remote) {
+        remote.username = profile.username;
+        if (profile.weaponClass && profile.weaponClass !== remote.weaponClass) {
+          remote.changeWeapon(profile.weaponClass);
+        }
+        if (typeof profile.health === 'number') {
+          remote.updateHealth(profile.health, 100);
+        }
+      }
+    }
+
+    this.updateOnlineCount();
+
+    this.ui.updateScoreboardEntry({
+      id: peerId,
+      username: profile.username || 'Operative',
+      color: profile.color || '#00f0ff',
+      kills: profile.kills || 0,
+      deaths: profile.deaths || 0,
+      score: profile.score || 0
+    });
+  }
+
+  onReceiveState(data, peerId) {
+    if (!data) return;
+
+    let remote = this.remotePlayers.get(peerId);
+    // Auto-create remote 3D player mesh inside onState if remotePlayers[peerId] doesn't exist yet!
+    if (!remote) {
+      this.addRemotePlayer({
+        id: peerId,
+        username: data.username || 'Operative',
+        color: data.color || '#00f0ff',
+        weaponClass: data.weaponClass || 'assault',
+        health: data.health ?? 100,
+        isAlive: data.isAlive !== false,
+        position: data.position || { x: 0, y: 0, z: 0 }
+      });
+      remote = this.remotePlayers.get(peerId);
+
+      if (!this.announcedPeers.has(peerId)) {
+        this.announcedPeers.add(peerId);
+        this.ui.addKillFeedMessage(`${data.username || 'Operative'} joined the arena`, 'system');
+      }
+
+      // Return handshake profile
+      this.sendSelfProfile(peerId);
+      this.updateOnlineCount();
+    }
+
+    if (remote) {
+      if (data.position) {
+        remote.targetPosition.set(data.position.x, data.position.y, data.position.z);
+      }
+      if (data.rotation) {
+        remote.targetRotation.yaw = data.rotation.yaw ?? 0;
+        remote.targetRotation.pitch = data.rotation.pitch ?? 0;
+      }
+      remote.isSprinting = !!data.isSprinting;
+      remote.isSliding = !!data.isSliding;
+
+      // Slide direction sync
+      if (remote.isSliding) {
+        if (typeof data.slideYaw === 'number') {
+          remote.slideYaw = data.slideYaw;
+        } else if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number' && (data.slideDirX !== 0 || data.slideDirZ !== 0)) {
+          remote.slideYaw = Math.atan2(-data.slideDirX, -data.slideDirZ);
+        }
+        if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number') {
+          remote.slideDir.set(data.slideDirX, data.slideDirZ);
+        }
+      }
+
+      remote.isAlive = data.isAlive !== false;
+
+      if (typeof data.health === 'number') {
+        remote.updateHealth(data.health, 100);
+      }
+
+      if (data.weaponClass && data.weaponClass !== remote.weaponClass) {
+        remote.changeWeapon(data.weaponClass);
+      }
+    }
+
+    if (data.kills !== undefined || data.deaths !== undefined || data.score !== undefined) {
+      this.ui.updateScoreboardEntry({
+        id: peerId,
+        username: data.username || remote?.username || 'Operative',
+        color: data.color || remote?.color || '#00f0ff',
+        kills: data.kills || 0,
+        deaths: data.deaths || 0,
+        score: data.score || 0
+      });
+    }
+  }
+
+  onReceiveShoot(data, peerId) {
+    if (!data) return;
+
+    const remote = this.remotePlayers.get(peerId);
+    const origin = new THREE.Vector3(data.origin.x, data.origin.y, data.origin.z);
+    const hitPoint = new THREE.Vector3(data.hitPoint.x, data.hitPoint.y, data.hitPoint.z);
+
+    if (remote) {
+      remote.triggerMuzzleFlash();
+    }
+
+    // Distance audio attenuation
+    const dist = this.camera.position.distanceTo(origin);
+    audio.playGunshot(data.weaponClass || 'assault', true, dist);
+
+    // Render 3D bullet tracer line
+    this.spawnTracer(origin, hitPoint);
+  }
+
+  onReceiveHit(data, peerId) {
+    if (!data || !this.localPlayerRef || !this.localPlayerRef.isAlive) return;
+
+    const damage = data.damage || 20;
+    const isHeadshot = !!data.isHeadshot;
+    const hitPoint = data.hitPoint || { x: this.camera.position.x, y: this.camera.position.y, z: this.camera.position.z };
+
+    // Deduct health locally
+    this.localPlayerRef.health = Math.max(0, this.localPlayerRef.health - damage);
+    this.lastDamageTime = Date.now();
+    this.isRegenerating = false;
+
+    // Audio & visual feedback on hit
+    audio.playDamageTaken();
+    this.ui.triggerDamageFlash();
+    this.ui.updateHealth(this.localPlayerRef.health, 100, false);
+
+    // Send damage confirmation directly back to the attacker
+    const confirmMsgId = 'confirm_' + this.selfId + '_' + Date.now();
+    this.broadcastPacket('damageConfirm', {
+      damage,
+      isHeadshot,
+      hitPoint,
+      remainingHealth: this.localPlayerRef.health,
+      victimId: this.selfId
+    }, peerId, confirmMsgId);
+
+    // Broadcast health update to room for overhead health bars
+    this.broadcastPacket('healthUpdate', {
+      playerId: this.selfId,
+      health: this.localPlayerRef.health,
+      maxHealth: 100,
+      isRegenerating: false
+    });
+
+    // Handle elimination
+    if (this.localPlayerRef.health <= 0) {
+      this.localPlayerRef.isAlive = false;
+      this.localPlayerRef.isADS = false;
+      this.ui.setAds(false, false);
+      this.deaths += 1;
+      this.updateScoreboardSelf();
+
+      // Broadcast elimination event to all peers
+      const killMsgId = 'kill_' + this.selfId + '_' + Date.now();
+      this.broadcastPacket('kill', {
+        killerId: data.attackerId,
+        killerName: data.attackerName || 'Enemy',
+        victimId: this.selfId,
+        victimName: this.username,
+        weaponClass: data.weaponClass || 'assault',
+        isHeadshot
+      }, null, killMsgId);
+
+      // Local elimination UI & sound
+      audio.playElimination();
+      this.ui.showEliminationScreen(data.attackerName || 'Enemy', isHeadshot, 3000);
+
+      // Client-side 3-second safe auto-respawn
+      setTimeout(() => {
+        const respawnPoint = getSafeSpawnPoint(this.remotePlayers);
+        this.localPlayerRef.health = 100;
+        this.localPlayerRef.isAlive = true;
+        this.lastDamageTime = 0;
+        this.isRegenerating = false;
+        this.localPlayerRef.respawn(respawnPoint, 100);
+
+        // Broadcast respawn event to all peers
+        const respawnMsgId = 'respawn_' + this.selfId + '_' + Date.now();
+        this.broadcastPacket('respawn', {
+          id: this.selfId,
+          position: respawnPoint,
+          health: 100
+        }, null, respawnMsgId);
+      }, 3000);
+    }
+  }
+
+  onReceiveDamageConfirm(data, peerId) {
+    if (!data) return;
+    audio.playHitmarker(data.isHeadshot);
+    this.ui.showHitmarker(data.isHeadshot);
+    if (data.hitPoint) {
+      this.ui.spawnFloatingDamage(data.hitPoint, data.damage, data.isHeadshot, this.camera);
+    }
+  }
+
+  onReceiveHealthUpdate(data, peerId) {
+    if (!data) return;
+    const targetId = data.playerId || peerId;
+    if (targetId === this.selfId) return;
+
+    const remote = this.remotePlayers.get(targetId);
+    if (remote) {
+      remote.updateHealth(data.health, data.maxHealth || 100);
+    }
+  }
+
+  onReceiveKill(data, peerId) {
+    if (!data) return;
+
+    this.ui.addKillFeedKill(data.killerName, data.victimName, data.weaponClass, data.isHeadshot);
+
+    // If local player was the killer
+    if (data.killerId === this.selfId) {
+      this.kills += 1;
+      this.score += data.isHeadshot ? 150 : 100;
+      audio.playKillConfirmed();
+      this.ui.showKillBanner(data.victimName, data.isHeadshot);
+      this.updateScoreboardSelf();
+    }
+
+    // If victim was a remote player
+    if (data.victimId !== this.selfId) {
+      const remote = this.remotePlayers.get(data.victimId);
+      if (remote) {
+        remote.onEliminated();
+      }
+    }
+  }
+
+  onReceiveRespawn(data, peerId) {
+    if (!data) return;
+    const targetId = data.id || peerId;
+    if (targetId === this.selfId) return;
+
+    const remote = this.remotePlayers.get(targetId);
+    if (remote && data.position) {
+      remote.onRespawn(data.position);
+    }
+  }
+
+  onReceiveChat(data, peerId) {
+    if (!data) return;
+    this.ui.addChatMessage(data.sender, data.color, data.text);
+  }
+
+  onReceiveLeave(peerId) {
+    const remote = this.remotePlayers.get(peerId);
+    if (remote) {
+      this.ui.addKillFeedMessage(`${remote.username} left the arena`, 'system');
+    }
+    this.removeRemotePlayer(peerId);
+    this.announcedPeers.delete(peerId);
+    this.updateOnlineCount();
+  }
+
+  // Periodic heartbeat & state broadcast (runs on setInterval so it never freezes in background tabs)
+  broadcastHeartbeatAndState() {
+    if (!this.localPlayerRef) return;
+
+    // Send continuous state broadcast
+    this.sendCurrentState();
+
+    // Check automatic health regeneration even when tab is in background
+    this.checkHealthRegen();
+
+    // Periodic heartbeat profile ping (every 2 seconds) to guarantee peer awareness
+    const now = performance.now();
+    if (now - this.lastHeartbeatTime > 2000) {
+      this.lastHeartbeatTime = now;
+      this.sendSelfProfile();
+    }
+  }
+
   sendSelfProfile(targetPeerId = null) {
-    if (!this.sendProfile) return;
     const profile = {
       id: this.selfId,
       username: this.username,
@@ -481,16 +661,12 @@ export class NetworkManager {
       } : { x: 0, y: 0, z: 0 }
     };
 
-    if (targetPeerId) {
-      this.sendProfile(profile, targetPeerId);
-    } else {
-      this.sendProfile(profile);
-    }
+    this.broadcastPacket('profile', profile, targetPeerId);
   }
 
   sendCurrentState(targetPeerId = null) {
-    if (!this.sendState || !this.localPlayerRef) return;
-    const camEuler = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ');
+    if (!this.localPlayerRef) return;
+    const camEuler = new THREE.Euler(0, 0, 0, 'YXZ').setFromQuaternion(this.camera.quaternion);
     const state = {
       id: this.selfId,
       username: this.username,
@@ -522,21 +698,15 @@ export class NetworkManager {
       score: this.score
     };
 
-    if (targetPeerId) {
-      this.sendState(state, targetPeerId);
-    } else {
-      this.sendState(state);
-    }
+    this.broadcastPacket('state', state, targetPeerId);
   }
 
   sendPlayerState(state) {
-    if (!this.sendState) return;
-
     const now = performance.now();
     if (now - this.lastSent < this.sendRateMs) return;
     this.lastSent = now;
 
-    this.sendState({
+    const fullState = {
       id: this.selfId,
       username: this.username,
       color: this.color,
@@ -547,52 +717,57 @@ export class NetworkManager {
       kills: this.kills,
       deaths: this.deaths,
       score: this.score
-    });
+    };
+
+    this.broadcastPacket('state', fullState);
   }
 
   recordHit(targetId, hitboxType, hitPoint) {
-    if (!this.sendHit) return;
-
     const weapon = WEAPONS_STATS[this.weaponClass] || WEAPONS_STATS.assault;
     const isHeadshot = hitboxType === 'head';
     const baseDamage = weapon.damage;
     const actualDamage = isHeadshot ? Math.round(baseDamage * weapon.headMultiplier) : baseDamage;
 
-    // Send hit payload directly to target peer
-    this.sendHit({
+    const msgId = 'hit_' + this.selfId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+
+    // Send hit payload directly to target peer via dual transport
+    this.broadcastPacket('hit', {
       damage: actualDamage,
       isHeadshot,
       hitPoint: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z },
       attackerId: this.selfId,
       attackerName: this.username,
       weaponClass: this.weaponClass
-    }, targetId);
+    }, targetId, msgId);
   }
 
   broadcastShoot(origin, direction, hitPoint) {
-    if (!this.sendShoot) return;
-    this.sendShoot({
+    const msgId = 'shoot_' + this.selfId + '_' + Date.now();
+    this.broadcastPacket('shoot', {
       origin: { x: origin.x, y: origin.y, z: origin.z },
       direction: { x: direction.x, y: direction.y, z: direction.z },
       hitPoint: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z },
       weaponClass: this.weaponClass
-    });
+    }, null, msgId);
   }
 
   changeWeapon(newWeaponClass) {
     this.weaponClass = newWeaponClass;
     this.sendSelfProfile();
+    this.sendCurrentState();
   }
 
   sendChatMessage(text) {
     const cleanText = (text || '').toString().trim().slice(0, 100);
-    if (!cleanText || !this.sendChat) return;
+    if (!cleanText) return;
 
-    this.sendChat({
+    const msgId = 'chat_' + this.selfId + '_' + Date.now();
+    this.broadcastPacket('chat', {
       sender: this.username,
       color: this.color,
       text: cleanText
-    });
+    }, null, msgId);
+
     this.ui.addChatMessage(this.username, this.color, cleanText);
   }
 
@@ -667,44 +842,71 @@ export class NetworkManager {
     }, 80);
   }
 
+  checkHealthRegen() {
+    if (!this.localPlayerRef || !this.localPlayerRef.isAlive || this.localPlayerRef.health >= 100) {
+      if (this.isRegenerating) {
+        this.isRegenerating = false;
+        this.ui.updateHealth(this.localPlayerRef?.health || 100, 100, false);
+      }
+      return;
+    }
+
+    const now = Date.now();
+    if (this.lastDamageTime > 0 && now - this.lastDamageTime >= 5000) {
+      if (now - this.lastRegenTick >= 250) {
+        this.lastRegenTick = now;
+        const prevHp = this.localPlayerRef.health;
+        this.localPlayerRef.health = Math.min(100, this.localPlayerRef.health + 5);
+        this.isRegenerating = this.localPlayerRef.health < 100;
+
+        if (this.localPlayerRef.health !== prevHp) {
+          this.ui.updateHealth(this.localPlayerRef.health, 100, this.isRegenerating);
+          this.broadcastPacket('healthUpdate', {
+            playerId: this.selfId,
+            health: this.localPlayerRef.health,
+            maxHealth: 100,
+            isRegenerating: this.isRegenerating
+          });
+        }
+
+        if (!this.isRegenerating) {
+          this.lastDamageTime = 0;
+        }
+      }
+    }
+  }
+
   update(delta) {
     // 1. Update all remote player animations & interpolation
     for (const remote of this.remotePlayers.values()) {
       remote.update(delta);
     }
 
-    // 2. Client-side automatic health regeneration (5-second delay, +5 HP every 250ms)
-    if (this.localPlayerRef && this.localPlayerRef.isAlive && this.localPlayerRef.health < 100) {
-      const now = Date.now();
-      if (this.lastDamageTime > 0 && now - this.lastDamageTime >= 5000) {
-        if (now - this.lastRegenTick >= 250) {
-          this.lastRegenTick = now;
-          const prevHp = this.localPlayerRef.health;
-          this.localPlayerRef.health = Math.min(100, this.localPlayerRef.health + 5);
-          this.isRegenerating = this.localPlayerRef.health < 100;
+    // 2. Client-side automatic health regeneration
+    this.checkHealthRegen();
+  }
 
-          if (this.localPlayerRef.health !== prevHp) {
-            this.ui.updateHealth(this.localPlayerRef.health, 100, this.isRegenerating);
-
-            if (this.sendHealthUpdate) {
-              this.sendHealthUpdate({
-                playerId: this.selfId,
-                health: this.localPlayerRef.health,
-                maxHealth: 100,
-                isRegenerating: this.isRegenerating
-              });
-            }
-          }
-
-          if (!this.isRegenerating) {
-            this.lastDamageTime = 0;
-          }
-        }
-      }
-    } else if (this.isRegenerating) {
-      this.isRegenerating = false;
-      this.ui.updateHealth(this.localPlayerRef?.health || 100, 100, false);
+  destroy() {
+    if (this.broadcastInterval) {
+      clearInterval(this.broadcastInterval);
+      this.broadcastInterval = null;
     }
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.close();
+      } catch (_) {}
+      this.broadcastChannel = null;
+    }
+    if (this.room) {
+      try {
+        this.room.leave();
+      } catch (_) {}
+      this.room = null;
+    }
+    for (const remote of this.remotePlayers.values()) {
+      remote.destroy();
+    }
+    this.remotePlayers.clear();
   }
 }
 
@@ -872,15 +1074,18 @@ class RemotePlayer {
     this.nameplateTexture = new THREE.CanvasTexture(this.nameplateCanvas);
     this.nameplateTexture.minFilter = THREE.LinearFilter;
 
+    // Always-visible nameplate material through walls & bridges (depthTest: false, depthWrite: false, renderOrder: 9999)
     const spriteMat = new THREE.SpriteMaterial({
       map: this.nameplateTexture,
       transparent: true,
-      depthTest: false
+      depthTest: false,
+      depthWrite: false
     });
 
     this.nameplateSprite = new THREE.Sprite(spriteMat);
     this.nameplateSprite.position.set(0, 2.3, 0);
     this.nameplateSprite.scale.set(1.8, 0.5, 1);
+    this.nameplateSprite.renderOrder = 9999;
     this.root.add(this.nameplateSprite);
   }
 
@@ -1023,6 +1228,7 @@ class RemotePlayer {
     } else {
       this.leftLeg.position.z = THREE.MathUtils.lerp(this.leftLeg.position.z, 0, Math.min(1.0, delta * 10));
       this.rightLeg.position.z = THREE.MathUtils.lerp(this.rightLeg.position.z, 0, Math.min(1.0, delta * 10));
+
       // Walking / Running leg animations
       const moveDist = this.currentPosition.distanceTo(this.targetPosition);
       if (moveDist > 0.02) {
