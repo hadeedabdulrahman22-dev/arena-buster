@@ -176,6 +176,9 @@ io.on('connection', (socket) => {
 
     if (typeof data.isSliding === 'boolean') {
       player.isSliding = data.isSliding;
+      player.slideDirX = data.slideDirX ?? 0;
+      player.slideDirZ = data.slideDirZ ?? 0;
+      player.slideYaw = data.slideYaw ?? null;
     }
   });
 
@@ -380,6 +383,9 @@ setInterval(() => {
       velocity: p.velocity,
       isSprinting: p.isSprinting,
       isSliding: p.isSliding,
+      slideDirX: p.slideDirX || 0,
+      slideDirZ: p.slideDirZ || 0,
+      slideYaw: p.slideYaw ?? null,
       isRegenerating: p.isRegenerating,
       health: p.health,
       isAlive: p.isAlive,

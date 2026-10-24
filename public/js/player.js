@@ -139,18 +139,13 @@ export class LocalPlayer {
           if (this.canJump) {
             this.velocity.y = this.jumpForce;
             this.canJump = false;
-            if (this.isSliding) {
-              // Jump immediately out of slide
-              this.isSliding = false;
-              this.slideTimer = 0;
-            }
             audio.playJump();
           }
           break;
         case 'KeyC':
         case 'ControlLeft':
         case 'ControlRight':
-          this.tryStartSlide();
+          this.handleSlideInput();
           break;
         case 'ShiftLeft':
         case 'ShiftRight':
@@ -231,37 +226,92 @@ export class LocalPlayer {
     });
   }
 
+  handleSlideInput() {
+    if (!this.isAlive) return;
+
+    // Toggle slide cancel: pressing C / Ctrl a second time while sliding immediately cancels slide
+    if (this.isSliding) {
+      this.cancelSlide();
+      return;
+    }
+
+    this.tryStartSlide();
+  }
+
+  cancelSlide() {
+    if (!this.isSliding) return;
+    this.isSliding = false;
+    this.slideTimer = 0;
+    // Reset slide velocity so camera lerps smoothly back to normal standing
+    this.velocity.x = 0;
+    this.velocity.z = 0;
+  }
+
   tryStartSlide() {
     const now = performance.now() / 1000;
     if (this.isSliding || !this.isAlive) return;
     if (now - this.lastSlideTime < this.slideCooldown) return;
     if (!this.canJump) return; // Must be on the ground
 
-    // Check if player is moving forward or sprinting
-    const isMoving = this.moveInput.forward || this.moveInput.left || this.moveInput.right || this.isSprinting;
-    if (!isMoving) return;
+    // WASD movement inputs relative to camera:
+    // W: +1 (forward), S: -1 (backward)
+    // D: +1 (right),   A: -1 (left)
+    const forwardInput = Number(this.moveInput.forward) - Number(this.moveInput.backward);
+    const sideInput = Number(this.moveInput.right) - Number(this.moveInput.left);
 
+    let inputZ = forwardInput;
+    let inputX = sideInput;
+
+    // If no keys pressed, but sprinting with forward momentum, slide forward
+    if (inputX === 0 && inputZ === 0) {
+      if (this.isSprinting) {
+        inputZ = 1;
+      } else {
+        return; // Cannot initiate slide when standing completely still
+      }
+    }
+
+    // Normalize input vector so diagonals have exact 45-degree unit magnitude
+    const inputLen = Math.hypot(inputX, inputZ);
+    if (inputLen < 0.001) return;
+    inputX /= inputLen;
+    inputZ /= inputLen;
+
+    // Camera horizontal yaw angle
+    const camEuler = new THREE.Euler(0, 0, 0, 'YXZ').setFromQuaternion(this.camera.quaternion);
+    const yaw = camEuler.y;
+
+    // Camera horizontal forward (into screen along -Z) and right (along +X)
+    const forward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw).normalize();
+    const right = new THREE.Vector3(1, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw).normalize();
+
+    // Calculate world-space slide direction:
+    // D + Slide: strictly right
+    // A + Slide: strictly left
+    // S + Slide: strictly backward
+    // W + Slide: strictly forward
+    // W + D, S + D, etc: exact 45-degree diagonal vectors
+    const slideDir = new THREE.Vector3()
+      .addScaledVector(forward, inputZ)
+      .addScaledVector(right, inputX);
+    slideDir.y = 0;
+    slideDir.normalize();
+
+    this.slideDirection.copy(slideDir);
     this.isSliding = true;
     this.slideTimer = this.slideDuration;
     this.lastSlideTime = now;
 
-    // Get horizontal forward direction from camera
-    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
-    forward.y = 0;
-    forward.normalize();
-
-    // Blend with strafe if moving sideways
-    const sideInput = Number(this.moveInput.right) - Number(this.moveInput.left);
-    if (sideInput !== 0) {
-      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
-      right.y = 0;
-      right.normalize();
-      forward.addScaledVector(right, sideInput * 0.5).normalize();
+    // Set camera roll tilt based on slide direction
+    if (sideInput > 0) {
+      this.slideTiltAngle = 0.08;
+    } else if (sideInput < 0) {
+      this.slideTiltAngle = -0.08;
+    } else {
+      this.slideTiltAngle = -0.06;
     }
 
-    this.slideDirection.copy(forward);
-
-    // Initial forward speed burst
+    // Apply speed burst along the locked world-space vector
     this.velocity.x = this.slideDirection.x * this.slideInitialSpeed;
     this.velocity.z = this.slideDirection.z * this.slideInitialSpeed;
 
@@ -528,6 +578,8 @@ export class LocalPlayer {
 
       if (this.slideTimer <= 0) {
         this.isSliding = false;
+        this.velocity.x = 0;
+        this.velocity.z = 0;
       }
     } else {
       const currentSpeed = this.isSprinting ? this.sprintSpeed : this.walkSpeed;
@@ -551,7 +603,7 @@ export class LocalPlayer {
     // Apply gravity
     this.velocity.y -= this.gravity * delta;
 
-    // Smoothly lerp camera eye height down during slide (1.7 -> 0.85), and back up when finished
+    // Smoothly lerp camera eye height down during slide (1.7 -> 0.85), and back up when finished or canceled
     const targetEyeHeight = this.isSliding ? this.slideEyeHeight : this.normalEyeHeight;
     this.eyeHeight = THREE.MathUtils.lerp(this.eyeHeight, targetEyeHeight, delta * 12);
 
@@ -564,10 +616,16 @@ export class LocalPlayer {
     rollEuler.z = this.currentRoll;
     this.camera.quaternion.setFromEuler(rollEuler);
 
-    // Calculate move vector in world space
-    const moveVector = new THREE.Vector3();
-    this.controls.moveRight(-this.velocity.x * delta);
-    this.controls.moveForward(-this.velocity.z * delta);
+    // Apply movement:
+    // If sliding, move strictly along locked world-space direction vector
+    // If walking/sprinting, move relative to camera orientation via controls
+    if (this.isSliding) {
+      this.camera.position.x += this.velocity.x * delta;
+      this.camera.position.z += this.velocity.z * delta;
+    } else {
+      this.controls.moveRight(-this.velocity.x * delta);
+      this.controls.moveForward(-this.velocity.z * delta);
+    }
     this.camera.position.y += this.velocity.y * delta;
 
     // 2. Map & Ramp Collision Resolution (Full 3D AABB & Step-Up Support)
@@ -679,7 +737,10 @@ export class LocalPlayer {
           z: this.velocity.z
         },
         isSprinting: this.isSprinting,
-        isSliding: this.isSliding
+        isSliding: this.isSliding,
+        slideDirX: this.isSliding ? this.slideDirection.x : 0,
+        slideDirZ: this.isSliding ? this.slideDirection.z : 0,
+        slideYaw: this.isSliding ? Math.atan2(-this.slideDirection.x, -this.slideDirection.z) : null
       });
     }
 

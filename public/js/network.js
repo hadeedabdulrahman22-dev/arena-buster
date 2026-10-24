@@ -238,6 +238,19 @@ export class NetworkManager {
         }
         remote.isSprinting = !!data.isSprinting;
         remote.isSliding = !!data.isSliding;
+
+        // Slide direction sync
+        if (remote.isSliding) {
+          if (typeof data.slideYaw === 'number') {
+            remote.slideYaw = data.slideYaw;
+          } else if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number' && (data.slideDirX !== 0 || data.slideDirZ !== 0)) {
+            remote.slideYaw = Math.atan2(-data.slideDirX, -data.slideDirZ);
+          }
+          if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number') {
+            remote.slideDir.set(data.slideDirX, data.slideDirZ);
+          }
+        }
+
         remote.isAlive = data.isAlive !== false;
 
         if (typeof data.health === 'number') {
@@ -475,6 +488,9 @@ export class NetworkManager {
       },
       isSprinting: this.localPlayerRef.isSprinting,
       isSliding: this.localPlayerRef.isSliding,
+      slideDirX: this.localPlayerRef.isSliding ? this.localPlayerRef.slideDirection.x : 0,
+      slideDirZ: this.localPlayerRef.isSliding ? this.localPlayerRef.slideDirection.z : 0,
+      slideYaw: this.localPlayerRef.isSliding ? Math.atan2(-this.localPlayerRef.slideDirection.x, -this.localPlayerRef.slideDirection.z) : null,
       health: this.localPlayerRef.health,
       isAlive: this.localPlayerRef.isAlive,
       kills: this.kills,
@@ -686,6 +702,8 @@ class RemotePlayer {
     this.targetRotation = { yaw: 0, pitch: 0 };
     this.isSprinting = false;
     this.isSliding = false;
+    this.slideDir = new THREE.Vector2(0, 0);
+    this.slideYaw = 0;
     this.runCycle = 0;
 
     // Main 3D Container
@@ -912,16 +930,47 @@ class RemotePlayer {
     this.currentPosition.lerp(this.targetPosition, Math.min(1.0, delta * 18));
     this.root.position.copy(this.currentPosition);
 
-    // Smooth rotation interpolation
-    this.currentYaw = THREE.MathUtils.lerp(this.currentYaw, this.targetRotation.yaw, Math.min(1.0, delta * 15));
-    this.root.rotation.y = this.currentYaw;
+    // Angle interpolation helper that correctly wraps around shortest path
+    const lerpAngle = (current, target, t) => {
+      let diff = (target - current) % (Math.PI * 2);
+      if (diff < -Math.PI) diff += Math.PI * 2;
+      if (diff > Math.PI) diff -= Math.PI * 2;
+      return current + diff * t;
+    };
 
-    // Pitch weapon and head slightly towards aim direction
-    if (this.headMesh) {
-      this.headMesh.rotation.x = this.targetRotation.pitch;
-    }
-    if (this.weaponHolder) {
-      this.weaponHolder.rotation.x = this.targetRotation.pitch;
+    if (this.isSliding) {
+      // Orient the root body and legs in the actual direction of the slide!
+      const targetYaw = (typeof this.slideYaw === 'number') ? this.slideYaw : this.targetRotation.yaw;
+      this.currentYaw = lerpAngle(this.currentYaw, targetYaw, Math.min(1.0, delta * 18));
+      this.root.rotation.y = this.currentYaw;
+
+      // Allow head and weapon to point toward player's actual look/aim direction
+      let aimYawOffset = (this.targetRotation.yaw - this.currentYaw) % (Math.PI * 2);
+      if (aimYawOffset < -Math.PI) aimYawOffset += Math.PI * 2;
+      if (aimYawOffset > Math.PI) aimYawOffset -= Math.PI * 2;
+      aimYawOffset = Math.max(-1.3, Math.min(1.3, aimYawOffset));
+
+      if (this.headMesh) {
+        this.headMesh.rotation.y = THREE.MathUtils.lerp(this.headMesh.rotation.y, aimYawOffset, Math.min(1.0, delta * 15));
+        this.headMesh.rotation.x = this.targetRotation.pitch;
+      }
+      if (this.weaponHolder) {
+        this.weaponHolder.rotation.y = THREE.MathUtils.lerp(this.weaponHolder.rotation.y, aimYawOffset, Math.min(1.0, delta * 15));
+        this.weaponHolder.rotation.x = this.targetRotation.pitch;
+      }
+    } else {
+      // Normal standing/running: orient root to look yaw
+      this.currentYaw = lerpAngle(this.currentYaw, this.targetRotation.yaw, Math.min(1.0, delta * 15));
+      this.root.rotation.y = this.currentYaw;
+
+      if (this.headMesh) {
+        this.headMesh.rotation.y = THREE.MathUtils.lerp(this.headMesh.rotation.y, 0, Math.min(1.0, delta * 15));
+        this.headMesh.rotation.x = this.targetRotation.pitch;
+      }
+      if (this.weaponHolder) {
+        this.weaponHolder.rotation.y = THREE.MathUtils.lerp(this.weaponHolder.rotation.y, 0, Math.min(1.0, delta * 15));
+        this.weaponHolder.rotation.x = this.targetRotation.pitch;
+      }
     }
 
     // Smoothly lower body, head, arms, and hitboxes during slide
@@ -938,9 +987,13 @@ class RemotePlayer {
     this.nameplateSprite.position.y = THREE.MathUtils.lerp(this.nameplateSprite.position.y, targetNameplateY, Math.min(1.0, delta * 14));
 
     if (this.isSliding) {
-      this.leftLeg.rotation.x = THREE.MathUtils.lerp(this.leftLeg.rotation.x, -1.0, Math.min(1.0, delta * 12));
-      this.rightLeg.rotation.x = THREE.MathUtils.lerp(this.rightLeg.rotation.x, -0.8, Math.min(1.0, delta * 12));
+      this.leftLeg.rotation.x = THREE.MathUtils.lerp(this.leftLeg.rotation.x, -1.2, Math.min(1.0, delta * 14));
+      this.rightLeg.rotation.x = THREE.MathUtils.lerp(this.rightLeg.rotation.x, 0.4, Math.min(1.0, delta * 14));
+      this.leftLeg.position.z = THREE.MathUtils.lerp(this.leftLeg.position.z, 0.25, Math.min(1.0, delta * 14));
+      this.rightLeg.position.z = THREE.MathUtils.lerp(this.rightLeg.position.z, -0.2, Math.min(1.0, delta * 14));
     } else {
+      this.leftLeg.position.z = THREE.MathUtils.lerp(this.leftLeg.position.z, 0, Math.min(1.0, delta * 10));
+      this.rightLeg.position.z = THREE.MathUtils.lerp(this.rightLeg.position.z, 0, Math.min(1.0, delta * 10));
       // Walking / Running leg animations
       const moveDist = this.currentPosition.distanceTo(this.targetPosition);
       if (moveDist > 0.02) {
