@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { joinRoom, selfId } from 'trystero/torrent';
+import { joinRoom } from 'trystero/torrent';
 import { WeaponModelBuilder, WEAPON_DATA } from './weapons.js';
 import { audio } from './audio.js';
 
@@ -31,14 +31,15 @@ export const PLAYER_COLORS = [
 ];
 
 // Helper to select a spawn point that is safely distant from active enemies
-export function getSafeSpawnPoint(remotePlayers = new Map()) {
+export function getSafeSpawnPoint(remotePlayers = {}) {
   let bestPoint = SPAWN_POINTS[Math.floor(Math.random() * SPAWN_POINTS.length)];
   let maxMinDist = -1;
+  const remotes = remotePlayers instanceof Map ? Array.from(remotePlayers.values()) : Object.values(remotePlayers || {});
 
   for (const sp of SPAWN_POINTS) {
     let minDistToEnemy = Infinity;
-    for (const remote of remotePlayers.values()) {
-      if (remote.isAlive) {
+    for (const remote of remotes) {
+      if (remote && remote.isAlive && remote.currentPosition) {
         const dx = sp.x - remote.currentPosition.x;
         const dz = sp.z - remote.currentPosition.z;
         const dist = Math.hypot(dx, dz);
@@ -59,7 +60,10 @@ export class NetworkManager {
     this.scene = scene;
     this.camera = camera;
     this.ui = uiManager;
-    this.selfId = selfId;
+
+    // Persistent unique client ID generated ONCE when the page loads
+    this.myId = 'player_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
+    this.selfId = this.myId;
     this.localPlayerRef = null;
 
     this.roomId = 'GLOBAL-ARENA';
@@ -71,8 +75,8 @@ export class NetworkManager {
     this.deaths = 0;
     this.score = 0;
 
-    // Remote players map: peerId -> RemotePlayer
-    this.remotePlayers = new Map();
+    // Single dictionary of remote players strictly keyed by packet.peerId: peerId -> RemotePlayer
+    this.remotePlayers = {};
 
     // Hitbox meshes lookup for raycaster
     this.enemyHitboxes = [];
@@ -88,24 +92,7 @@ export class NetworkManager {
 
     // P2P Room instance & action handles
     this.room = null;
-    this.sendProfile = null;
-    this.getProfile = null;
-    this.sendState = null;
-    this.getState = null;
-    this.sendShoot = null;
-    this.getShoot = null;
-    this.sendHit = null;
-    this.getHit = null;
-    this.sendDamageConfirm = null;
-    this.getDamageConfirm = null;
-    this.sendHealthUpdate = null;
-    this.getHealthUpdate = null;
-    this.sendKill = null;
-    this.getKill = null;
-    this.sendRespawn = null;
-    this.getRespawn = null;
-    this.sendChat = null;
-    this.getChat = null;
+    this.sendFunctions = {};
 
     // Throttled network packet sender
     this.lastSent = 0;
@@ -126,11 +113,11 @@ export class NetworkManager {
   }
 
   connect(username, weaponClass, roomId = 'GLOBAL-ARENA', onConnected) {
-    this.username = (username || `Player_${this.selfId.slice(0, 4)}`).trim().slice(0, 16);
+    this.username = (username || `Player_${this.myId.slice(-4)}`).trim().slice(0, 16);
     this.weaponClass = ['assault', 'smg', 'sniper'].includes(weaponClass) ? weaponClass : 'assault';
     this.roomId = (roomId || 'GLOBAL-ARENA').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '') || 'GLOBAL-ARENA';
 
-    console.log(`[P2P Network] Joining room: ${this.roomId} as ${this.username} (Peer ID: ${this.selfId})`);
+    console.log(`[P2P Network] Joining room: ${this.roomId} as ${this.username} (Peer ID: ${this.myId})`);
 
     // Pick safe initial spawn point
     const initialSpawn = getSafeSpawnPoint(this.remotePlayers);
@@ -142,7 +129,7 @@ export class NetworkManager {
     this.updateScoreboardSelf();
     this.updateOnlineCount();
 
-    // 1. Setup high-speed native BroadcastChannel for instant same-browser multi-tab sync (0ms latency)
+    // 1. Setup native BroadcastChannel for instant same-browser multi-tab sync (0ms latency)
     try {
       if (typeof BroadcastChannel !== 'undefined') {
         if (this.broadcastChannel) {
@@ -151,9 +138,12 @@ export class NetworkManager {
         this.broadcastChannel = new BroadcastChannel('arena-buster-' + this.roomId);
         this.broadcastChannel.onmessage = (event) => {
           if (!event.data) return;
-          const { type, senderId, targetId, msgId, payload } = event.data;
-          if (!senderId || senderId === this.selfId) return;
-          if (targetId && targetId !== this.selfId) return;
+          const { type, peerId, targetPeerId, msgId, payload } = event.data;
+          const senderId = peerId || payload?.peerId;
+
+          // If packet.peerId === this.myId, ignore it completely!
+          if (!senderId || senderId === this.myId) return;
+          if (targetPeerId && targetPeerId !== this.myId) return;
 
           // Message deduplication
           if (msgId && this.hasSeenMessage(msgId)) return;
@@ -167,14 +157,15 @@ export class NetworkManager {
             try {
               this.broadcastChannel.postMessage({
                 type: 'leave',
-                senderId: this.selfId
+                peerId: this.myId,
+                payload: { peerId: this.myId }
               });
             } catch (_) {}
           }
         });
       }
     } catch (err) {
-      console.warn('[P2P Network] BroadcastChannel not supported:', err);
+      console.warn('[P2P Network] BroadcastChannel error:', err);
     }
 
     // 2. Join Trystero decentralized WebRTC room via WebTorrent trackers for internet peers
@@ -183,45 +174,56 @@ export class NetworkManager {
       this.room = joinRoom({ appId }, this.roomId);
 
       // Register Trystero action channels
-      [this.sendProfile, this.getProfile] = this.room.makeAction('profile');
-      [this.sendState, this.getState] = this.room.makeAction('state');
-      [this.sendShoot, this.getShoot] = this.room.makeAction('shoot');
-      [this.sendHit, this.getHit] = this.room.makeAction('hit');
-      [this.sendDamageConfirm, this.getDamageConfirm] = this.room.makeAction('damageConfirm');
-      [this.sendHealthUpdate, this.getHealthUpdate] = this.room.makeAction('healthUpdate');
-      [this.sendKill, this.getKill] = this.room.makeAction('kill');
-      [this.sendRespawn, this.getRespawn] = this.room.makeAction('respawn');
-      [this.sendChat, this.getChat] = this.room.makeAction('chat');
+      const [sendProfile, getProfile] = this.room.makeAction('profile');
+      const [sendState, getState] = this.room.makeAction('state');
+      const [sendShoot, getShoot] = this.room.makeAction('shoot');
+      const [sendHit, getHit] = this.room.makeAction('hit');
+      const [sendDamageConfirm, getDamageConfirm] = this.room.makeAction('damageConfirm');
+      const [sendHealthUpdate, getHealthUpdate] = this.room.makeAction('healthUpdate');
+      const [sendKill, getKill] = this.room.makeAction('kill');
+      const [sendRespawn, getRespawn] = this.room.makeAction('respawn');
+      const [sendChat, getChat] = this.room.makeAction('chat');
+
+      this.sendFunctions = {
+        profile: sendProfile,
+        state: sendState,
+        shoot: sendShoot,
+        hit: sendHit,
+        damageConfirm: sendDamageConfirm,
+        healthUpdate: sendHealthUpdate,
+        kill: sendKill,
+        respawn: sendRespawn,
+        chat: sendChat
+      };
 
       // Handle new peer connections via WebRTC
-      this.room.onPeerJoin((peerId) => {
-        console.log(`[P2P Network] WebRTC Peer joined room: ${peerId}`);
-        this.sendSelfProfile(peerId);
-        this.sendCurrentState(peerId);
-        this.updateOnlineCount();
+      this.room.onPeerJoin((trysteroId) => {
+        console.log(`[P2P WebRTC] Peer connected: ${trysteroId}`);
+        this.sendSelfProfile(trysteroId);
+        this.sendCurrentState(trysteroId);
       });
 
       // Handle peer disconnections via WebRTC
-      this.room.onPeerLeave((peerId) => {
-        console.log(`[P2P Network] WebRTC Peer left room: ${peerId}`);
-        this.onReceiveLeave(peerId);
+      this.room.onPeerLeave((trysteroId) => {
+        console.log(`[P2P WebRTC] Peer left: ${trysteroId}`);
+        this.onReceiveLeave({ peerId: trysteroId }, trysteroId);
       });
 
       // Bind Trystero incoming actions to unified packet handler
-      this.getProfile((data, peerId) => this.handleIncomingPacket('profile', data, peerId));
-      this.getState((data, peerId) => this.handleIncomingPacket('state', data, peerId));
-      this.getShoot((data, peerId) => this.handleIncomingPacket('shoot', data, peerId));
-      this.getHit((data, peerId) => this.handleIncomingPacket('hit', data, peerId));
-      this.getDamageConfirm((data, peerId) => this.handleIncomingPacket('damageConfirm', data, peerId));
-      this.getHealthUpdate((data, peerId) => this.handleIncomingPacket('healthUpdate', data, peerId));
-      this.getKill((data, peerId) => this.handleIncomingPacket('kill', data, peerId));
-      this.getRespawn((data, peerId) => this.handleIncomingPacket('respawn', data, peerId));
-      this.getChat((data, peerId) => this.handleIncomingPacket('chat', data, peerId));
+      getProfile((data, trysteroId) => this.handleIncomingPacket('profile', data, data?.peerId || trysteroId));
+      getState((data, trysteroId) => this.handleIncomingPacket('state', data, data?.peerId || trysteroId));
+      getShoot((data, trysteroId) => this.handleIncomingPacket('shoot', data, data?.peerId || trysteroId));
+      getHit((data, trysteroId) => this.handleIncomingPacket('hit', data, data?.peerId || trysteroId));
+      getDamageConfirm((data, trysteroId) => this.handleIncomingPacket('damageConfirm', data, data?.peerId || trysteroId));
+      getHealthUpdate((data, trysteroId) => this.handleIncomingPacket('healthUpdate', data, data?.peerId || trysteroId));
+      getKill((data, trysteroId) => this.handleIncomingPacket('kill', data, data?.peerId || trysteroId));
+      getRespawn((data, trysteroId) => this.handleIncomingPacket('respawn', data, data?.peerId || trysteroId));
+      getChat((data, trysteroId) => this.handleIncomingPacket('chat', data, data?.peerId || trysteroId));
     } catch (err) {
       console.warn('[P2P Network] WebRTC room error:', err);
     }
 
-    // Broadcast our profile immediately so all local and remote peers discover us
+    // Broadcast our profile and state immediately so all peers discover us
     this.sendSelfProfile();
     this.sendCurrentState();
 
@@ -249,13 +251,16 @@ export class NetworkManager {
 
   // Dual-transport broadcast: sends via BroadcastChannel (local tabs) AND Trystero (internet peers)
   broadcastPacket(type, payload, targetPeerId = null, msgId = null) {
+    if (!payload) return;
+    payload.peerId = this.myId;
+
     // 1. Send via local browser BroadcastChannel (0ms latency)
     if (this.broadcastChannel) {
       try {
         this.broadcastChannel.postMessage({
           type,
-          senderId: this.selfId,
-          targetId: targetPeerId,
+          peerId: this.myId,
+          targetPeerId,
           msgId,
           payload
         });
@@ -265,46 +270,25 @@ export class NetworkManager {
     }
 
     // 2. Send via WebRTC data channel
-    switch (type) {
-      case 'profile':
-        if (this.sendProfile) {
-          if (targetPeerId) this.sendProfile(payload, targetPeerId);
-          else this.sendProfile(payload);
+    const sendFn = this.sendFunctions[type];
+    if (sendFn) {
+      try {
+        if (targetPeerId) {
+          sendFn(payload, targetPeerId);
+        } else {
+          sendFn(payload);
         }
-        break;
-      case 'state':
-        if (this.sendState) {
-          if (targetPeerId) this.sendState(payload, targetPeerId);
-          else this.sendState(payload);
-        }
-        break;
-      case 'shoot':
-        if (this.sendShoot) this.sendShoot(payload);
-        break;
-      case 'hit':
-        if (this.sendHit && targetPeerId) this.sendHit(payload, targetPeerId);
-        break;
-      case 'damageConfirm':
-        if (this.sendDamageConfirm && targetPeerId) this.sendDamageConfirm(payload, targetPeerId);
-        break;
-      case 'healthUpdate':
-        if (this.sendHealthUpdate) this.sendHealthUpdate(payload);
-        break;
-      case 'kill':
-        if (this.sendKill) this.sendKill(payload);
-        break;
-      case 'respawn':
-        if (this.sendRespawn) this.sendRespawn(payload);
-        break;
-      case 'chat':
-        if (this.sendChat) this.sendChat(payload);
-        break;
+      } catch (_) {}
     }
   }
 
   // Unified incoming packet router
-  handleIncomingPacket(type, payload, peerId) {
-    if (!peerId || peerId === this.selfId) return;
+  handleIncomingPacket(type, payload, fallbackPeerId = null) {
+    if (!payload) return;
+    const peerId = payload.peerId || payload.id || fallbackPeerId;
+
+    // If packet.peerId === this.myId, ignore it completely!
+    if (!peerId || peerId === this.myId) return;
 
     switch (type) {
       case 'profile':
@@ -335,16 +319,17 @@ export class NetworkManager {
         this.onReceiveChat(payload, peerId);
         break;
       case 'leave':
-        this.onReceiveLeave(peerId);
+        this.onReceiveLeave(payload, peerId);
         break;
     }
   }
 
   onReceiveProfile(profile, peerId) {
-    if (!profile) return;
+    if (!profile || !peerId || peerId === this.myId) return;
 
-    if (!this.remotePlayers.has(peerId)) {
-      this.addRemotePlayer({
+    let remote = this.remotePlayers[peerId];
+    if (!remote) {
+      remote = new RemotePlayer({
         id: peerId,
         username: profile.username || 'Operative',
         color: profile.color || '#00f0ff',
@@ -352,7 +337,11 @@ export class NetworkManager {
         health: profile.health ?? 100,
         isAlive: profile.isAlive ?? true,
         position: profile.position || { x: 0, y: 0, z: 0 }
-      });
+      }, this.scene);
+      remote.lastSeen = Date.now();
+      this.remotePlayers[peerId] = remote;
+      this.rebuildHitboxCache();
+      this.updateOnlineCount();
 
       if (!this.announcedPeers.has(peerId)) {
         this.announcedPeers.add(peerId);
@@ -362,24 +351,20 @@ export class NetworkManager {
       // Return handshake profile directly to this peer
       this.sendSelfProfile(peerId);
     } else {
-      const remote = this.remotePlayers.get(peerId);
-      if (remote) {
-        remote.username = profile.username;
-        if (profile.weaponClass && profile.weaponClass !== remote.weaponClass) {
-          remote.changeWeapon(profile.weaponClass);
-        }
-        if (typeof profile.health === 'number') {
-          remote.updateHealth(profile.health, 100);
-        }
+      remote.lastSeen = Date.now();
+      if (profile.username) remote.username = profile.username;
+      if (profile.weaponClass && profile.weaponClass !== remote.weaponClass) {
+        remote.changeWeapon(profile.weaponClass);
+      }
+      if (typeof profile.health === 'number') {
+        remote.updateHealth(profile.health, 100);
       }
     }
 
-    this.updateOnlineCount();
-
     this.ui.updateScoreboardEntry({
       id: peerId,
-      username: profile.username || 'Operative',
-      color: profile.color || '#00f0ff',
+      username: remote.username,
+      color: remote.color,
       kills: profile.kills || 0,
       deaths: profile.deaths || 0,
       score: profile.score || 0
@@ -387,12 +372,14 @@ export class NetworkManager {
   }
 
   onReceiveState(data, peerId) {
-    if (!data) return;
+    if (!data || !peerId || peerId === this.myId) return;
 
-    let remote = this.remotePlayers.get(peerId);
-    // Auto-create remote 3D player mesh inside onState if remotePlayers[peerId] doesn't exist yet!
+    let remote = this.remotePlayers[peerId];
+
+    // Maintain a single dictionary this.remotePlayers = {} keyed strictly by packet.peerId.
+    // If this.remotePlayers[packet.peerId] ALREADY exists, NEVER create a new THREE.Group or add a new mesh to this.scene!
     if (!remote) {
-      this.addRemotePlayer({
+      remote = new RemotePlayer({
         id: peerId,
         username: data.username || 'Operative',
         color: data.color || '#00f0ff',
@@ -400,8 +387,11 @@ export class NetworkManager {
         health: data.health ?? 100,
         isAlive: data.isAlive !== false,
         position: data.position || { x: 0, y: 0, z: 0 }
-      });
-      remote = this.remotePlayers.get(peerId);
+      }, this.scene);
+      remote.lastSeen = Date.now();
+      this.remotePlayers[peerId] = remote;
+      this.rebuildHitboxCache();
+      this.updateOnlineCount();
 
       if (!this.announcedPeers.has(peerId)) {
         this.announcedPeers.add(peerId);
@@ -410,48 +400,48 @@ export class NetworkManager {
 
       // Return handshake profile
       this.sendSelfProfile(peerId);
-      this.updateOnlineCount();
     }
 
-    if (remote) {
-      if (data.position) {
-        remote.targetPosition.set(data.position.x, data.position.y, data.position.z);
-      }
-      if (data.rotation) {
-        remote.targetRotation.yaw = data.rotation.yaw ?? 0;
-        remote.targetRotation.pitch = data.rotation.pitch ?? 0;
-      }
-      remote.isSprinting = !!data.isSprinting;
-      remote.isSliding = !!data.isSliding;
+    // ONLY update existing character's position, rotation, and animation
+    remote.lastSeen = Date.now();
 
-      // Slide direction sync
-      if (remote.isSliding) {
-        if (typeof data.slideYaw === 'number') {
-          remote.slideYaw = data.slideYaw;
-        } else if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number' && (data.slideDirX !== 0 || data.slideDirZ !== 0)) {
-          remote.slideYaw = Math.atan2(-data.slideDirX, -data.slideDirZ);
-        }
-        if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number') {
-          remote.slideDir.set(data.slideDirX, data.slideDirZ);
-        }
-      }
+    if (data.position) {
+      remote.targetPosition.set(data.position.x, data.position.y, data.position.z);
+    }
+    if (data.rotation) {
+      remote.targetRotation.yaw = data.rotation.yaw ?? 0;
+      remote.targetRotation.pitch = data.rotation.pitch ?? 0;
+    }
+    remote.isSprinting = !!data.isSprinting;
+    remote.isSliding = !!data.isSliding;
 
-      remote.isAlive = data.isAlive !== false;
-
-      if (typeof data.health === 'number') {
-        remote.updateHealth(data.health, 100);
+    // Slide direction sync
+    if (remote.isSliding) {
+      if (typeof data.slideYaw === 'number') {
+        remote.slideYaw = data.slideYaw;
+      } else if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number' && (data.slideDirX !== 0 || data.slideDirZ !== 0)) {
+        remote.slideYaw = Math.atan2(-data.slideDirX, -data.slideDirZ);
       }
-
-      if (data.weaponClass && data.weaponClass !== remote.weaponClass) {
-        remote.changeWeapon(data.weaponClass);
+      if (typeof data.slideDirX === 'number' && typeof data.slideDirZ === 'number') {
+        remote.slideDir.set(data.slideDirX, data.slideDirZ);
       }
+    }
+
+    remote.isAlive = data.isAlive !== false;
+
+    if (typeof data.health === 'number') {
+      remote.updateHealth(data.health, 100);
+    }
+
+    if (data.weaponClass && data.weaponClass !== remote.weaponClass) {
+      remote.changeWeapon(data.weaponClass);
     }
 
     if (data.kills !== undefined || data.deaths !== undefined || data.score !== undefined) {
       this.ui.updateScoreboardEntry({
         id: peerId,
-        username: data.username || remote?.username || 'Operative',
-        color: data.color || remote?.color || '#00f0ff',
+        username: data.username || remote.username,
+        color: data.color || remote.color,
         kills: data.kills || 0,
         deaths: data.deaths || 0,
         score: data.score || 0
@@ -460,15 +450,16 @@ export class NetworkManager {
   }
 
   onReceiveShoot(data, peerId) {
-    if (!data) return;
+    if (!data || !peerId || peerId === this.myId) return;
 
-    const remote = this.remotePlayers.get(peerId);
-    const origin = new THREE.Vector3(data.origin.x, data.origin.y, data.origin.z);
-    const hitPoint = new THREE.Vector3(data.hitPoint.x, data.hitPoint.y, data.hitPoint.z);
-
+    const remote = this.remotePlayers[peerId];
     if (remote) {
+      remote.lastSeen = Date.now();
       remote.triggerMuzzleFlash();
     }
+
+    const origin = new THREE.Vector3(data.origin.x, data.origin.y, data.origin.z);
+    const hitPoint = new THREE.Vector3(data.hitPoint.x, data.hitPoint.y, data.hitPoint.z);
 
     // Distance audio attenuation
     const dist = this.camera.position.distanceTo(origin);
@@ -480,6 +471,9 @@ export class NetworkManager {
 
   onReceiveHit(data, peerId) {
     if (!data || !this.localPlayerRef || !this.localPlayerRef.isAlive) return;
+
+    // Check if local player is the target of the hit
+    if (data.targetId && data.targetId !== this.myId) return;
 
     const damage = data.damage || 20;
     const isHeadshot = !!data.isHeadshot;
@@ -496,18 +490,21 @@ export class NetworkManager {
     this.ui.updateHealth(this.localPlayerRef.health, 100, false);
 
     // Send damage confirmation directly back to the attacker
-    const confirmMsgId = 'confirm_' + this.selfId + '_' + Date.now();
+    const confirmMsgId = 'confirm_' + this.myId + '_' + Date.now();
     this.broadcastPacket('damageConfirm', {
+      peerId: this.myId,
+      attackerId: data.attackerId,
       damage,
       isHeadshot,
       hitPoint,
       remainingHealth: this.localPlayerRef.health,
-      victimId: this.selfId
-    }, peerId, confirmMsgId);
+      victimId: this.myId
+    }, data.attackerId, confirmMsgId);
 
     // Broadcast health update to room for overhead health bars
     this.broadcastPacket('healthUpdate', {
-      playerId: this.selfId,
+      peerId: this.myId,
+      playerId: this.myId,
       health: this.localPlayerRef.health,
       maxHealth: 100,
       isRegenerating: false
@@ -522,11 +519,12 @@ export class NetworkManager {
       this.updateScoreboardSelf();
 
       // Broadcast elimination event to all peers
-      const killMsgId = 'kill_' + this.selfId + '_' + Date.now();
+      const killMsgId = 'kill_' + this.myId + '_' + Date.now();
       this.broadcastPacket('kill', {
+        peerId: this.myId,
         killerId: data.attackerId,
         killerName: data.attackerName || 'Enemy',
-        victimId: this.selfId,
+        victimId: this.myId,
         victimName: this.username,
         weaponClass: data.weaponClass || 'assault',
         isHeadshot
@@ -546,9 +544,10 @@ export class NetworkManager {
         this.localPlayerRef.respawn(respawnPoint, 100);
 
         // Broadcast respawn event to all peers
-        const respawnMsgId = 'respawn_' + this.selfId + '_' + Date.now();
+        const respawnMsgId = 'respawn_' + this.myId + '_' + Date.now();
         this.broadcastPacket('respawn', {
-          id: this.selfId,
+          peerId: this.myId,
+          id: this.myId,
           position: respawnPoint,
           health: 100
         }, null, respawnMsgId);
@@ -558,6 +557,8 @@ export class NetworkManager {
 
   onReceiveDamageConfirm(data, peerId) {
     if (!data) return;
+    if (data.attackerId !== this.myId) return;
+
     audio.playHitmarker(data.isHeadshot);
     this.ui.showHitmarker(data.isHeadshot);
     if (data.hitPoint) {
@@ -567,11 +568,12 @@ export class NetworkManager {
 
   onReceiveHealthUpdate(data, peerId) {
     if (!data) return;
-    const targetId = data.playerId || peerId;
-    if (targetId === this.selfId) return;
+    const targetId = data.playerId || data.peerId || peerId;
+    if (targetId === this.myId) return;
 
-    const remote = this.remotePlayers.get(targetId);
+    const remote = this.remotePlayers[targetId];
     if (remote) {
+      remote.lastSeen = Date.now();
       remote.updateHealth(data.health, data.maxHealth || 100);
     }
   }
@@ -582,7 +584,7 @@ export class NetworkManager {
     this.ui.addKillFeedKill(data.killerName, data.victimName, data.weaponClass, data.isHeadshot);
 
     // If local player was the killer
-    if (data.killerId === this.selfId) {
+    if (data.killerId === this.myId) {
       this.kills += 1;
       this.score += data.isHeadshot ? 150 : 100;
       audio.playKillConfirmed();
@@ -591,8 +593,8 @@ export class NetworkManager {
     }
 
     // If victim was a remote player
-    if (data.victimId !== this.selfId) {
-      const remote = this.remotePlayers.get(data.victimId);
+    if (data.victimId !== this.myId) {
+      const remote = this.remotePlayers[data.victimId];
       if (remote) {
         remote.onEliminated();
       }
@@ -601,11 +603,12 @@ export class NetworkManager {
 
   onReceiveRespawn(data, peerId) {
     if (!data) return;
-    const targetId = data.id || peerId;
-    if (targetId === this.selfId) return;
+    const targetId = data.id || data.peerId || peerId;
+    if (targetId === this.myId) return;
 
-    const remote = this.remotePlayers.get(targetId);
+    const remote = this.remotePlayers[targetId];
     if (remote && data.position) {
+      remote.lastSeen = Date.now();
       remote.onRespawn(data.position);
     }
   }
@@ -615,14 +618,37 @@ export class NetworkManager {
     this.ui.addChatMessage(data.sender, data.color, data.text);
   }
 
-  onReceiveLeave(peerId) {
-    const remote = this.remotePlayers.get(peerId);
+  onReceiveLeave(packet, peerId) {
+    const targetId = packet?.peerId || peerId;
+    if (!targetId || targetId === this.myId) return;
+
+    const remote = this.remotePlayers[targetId];
     if (remote) {
       this.ui.addKillFeedMessage(`${remote.username} left the arena`, 'system');
+      this.removeRemotePlayer(targetId);
     }
-    this.removeRemotePlayer(peerId);
-    this.announcedPeers.delete(peerId);
-    this.updateOnlineCount();
+  }
+
+  // Periodic check: if a peer hasn't sent a packet in 4 seconds, remove their 3D mesh
+  checkPeerTimeouts() {
+    const now = Date.now();
+    let changed = false;
+    for (const peerId of Object.keys(this.remotePlayers)) {
+      const remote = this.remotePlayers[peerId];
+      if (remote && now - remote.lastSeen > 4000) {
+        console.log(`[P2P Network] Removing timed-out peer (>4s): ${peerId}`);
+        this.ui.addKillFeedMessage(`${remote.username} disconnected`, 'system');
+        remote.destroy();
+        delete this.remotePlayers[peerId];
+        this.announcedPeers.delete(peerId);
+        this.ui.removeScoreboardEntry(peerId);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.rebuildHitboxCache();
+      this.updateOnlineCount();
+    }
   }
 
   // Periodic heartbeat & state broadcast (runs on setInterval so it never freezes in background tabs)
@@ -635,6 +661,9 @@ export class NetworkManager {
     // Check automatic health regeneration even when tab is in background
     this.checkHealthRegen();
 
+    // Check peer timeouts (4s inactivity) even when tab is in background
+    this.checkPeerTimeouts();
+
     // Periodic heartbeat profile ping (every 2 seconds) to guarantee peer awareness
     const now = performance.now();
     if (now - this.lastHeartbeatTime > 2000) {
@@ -645,7 +674,8 @@ export class NetworkManager {
 
   sendSelfProfile(targetPeerId = null) {
     const profile = {
-      id: this.selfId,
+      peerId: this.myId,
+      id: this.myId,
       username: this.username,
       weaponClass: this.weaponClass,
       color: this.color,
@@ -668,7 +698,8 @@ export class NetworkManager {
     if (!this.localPlayerRef) return;
     const camEuler = new THREE.Euler(0, 0, 0, 'YXZ').setFromQuaternion(this.camera.quaternion);
     const state = {
-      id: this.selfId,
+      peerId: this.myId,
+      id: this.myId,
       username: this.username,
       color: this.color,
       weaponClass: this.weaponClass,
@@ -707,7 +738,8 @@ export class NetworkManager {
     this.lastSent = now;
 
     const fullState = {
-      id: this.selfId,
+      peerId: this.myId,
+      id: this.myId,
       username: this.username,
       color: this.color,
       weaponClass: this.weaponClass,
@@ -728,22 +760,25 @@ export class NetworkManager {
     const baseDamage = weapon.damage;
     const actualDamage = isHeadshot ? Math.round(baseDamage * weapon.headMultiplier) : baseDamage;
 
-    const msgId = 'hit_' + this.selfId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    const msgId = 'hit_' + this.myId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
 
     // Send hit payload directly to target peer via dual transport
     this.broadcastPacket('hit', {
+      peerId: this.myId,
+      targetId,
       damage: actualDamage,
       isHeadshot,
       hitPoint: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z },
-      attackerId: this.selfId,
+      attackerId: this.myId,
       attackerName: this.username,
       weaponClass: this.weaponClass
     }, targetId, msgId);
   }
 
   broadcastShoot(origin, direction, hitPoint) {
-    const msgId = 'shoot_' + this.selfId + '_' + Date.now();
+    const msgId = 'shoot_' + this.myId + '_' + Date.now();
     this.broadcastPacket('shoot', {
+      peerId: this.myId,
       origin: { x: origin.x, y: origin.y, z: origin.z },
       direction: { x: direction.x, y: direction.y, z: direction.z },
       hitPoint: { x: hitPoint.x, y: hitPoint.y, z: hitPoint.z },
@@ -761,8 +796,9 @@ export class NetworkManager {
     const cleanText = (text || '').toString().trim().slice(0, 100);
     if (!cleanText) return;
 
-    const msgId = 'chat_' + this.selfId + '_' + Date.now();
+    const msgId = 'chat_' + this.myId + '_' + Date.now();
     this.broadcastPacket('chat', {
+      peerId: this.myId,
       sender: this.username,
       color: this.color,
       text: cleanText
@@ -773,7 +809,7 @@ export class NetworkManager {
 
   updateScoreboardSelf() {
     this.ui.updateScoreboardEntry({
-      id: this.selfId,
+      id: this.myId,
       username: this.username,
       color: this.color,
       kills: this.kills,
@@ -783,31 +819,26 @@ export class NetworkManager {
   }
 
   updateOnlineCount() {
-    const count = this.remotePlayers.size + 1; // self + connected peers
+    const count = 1 + Object.keys(this.remotePlayers).length;
     this.ui.updateOnlineCount(count, this.roomId);
   }
 
-  addRemotePlayer(data) {
-    if (this.remotePlayers.has(data.id)) return;
-    const remote = new RemotePlayer(data, this.scene);
-    this.remotePlayers.set(data.id, remote);
-    this.rebuildHitboxCache();
-  }
-
-  removeRemotePlayer(id) {
-    const remote = this.remotePlayers.get(id);
+  removeRemotePlayer(peerId) {
+    const remote = this.remotePlayers[peerId];
     if (remote) {
       remote.destroy();
-      this.remotePlayers.delete(id);
+      delete this.remotePlayers[peerId];
+      this.announcedPeers.delete(peerId);
       this.rebuildHitboxCache();
-      this.ui.removeScoreboardEntry(id);
+      this.updateOnlineCount();
+      this.ui.removeScoreboardEntry(peerId);
     }
   }
 
   rebuildHitboxCache() {
     this.enemyHitboxes = [];
-    for (const remote of this.remotePlayers.values()) {
-      if (remote.isAlive) {
+    for (const remote of Object.values(this.remotePlayers)) {
+      if (remote && remote.isAlive) {
         if (remote.headHitbox) this.enemyHitboxes.push(remote.headHitbox);
         if (remote.bodyHitbox) this.enemyHitboxes.push(remote.bodyHitbox);
       }
@@ -862,7 +893,8 @@ export class NetworkManager {
         if (this.localPlayerRef.health !== prevHp) {
           this.ui.updateHealth(this.localPlayerRef.health, 100, this.isRegenerating);
           this.broadcastPacket('healthUpdate', {
-            playerId: this.selfId,
+            peerId: this.myId,
+            playerId: this.myId,
             health: this.localPlayerRef.health,
             maxHealth: 100,
             isRegenerating: this.isRegenerating
@@ -877,12 +909,15 @@ export class NetworkManager {
   }
 
   update(delta) {
-    // 1. Update all remote player animations & interpolation
-    for (const remote of this.remotePlayers.values()) {
+    // 1. Check for peer timeouts (> 4 seconds of inactivity)
+    this.checkPeerTimeouts();
+
+    // 2. Update all remote player animations & interpolation
+    for (const remote of Object.values(this.remotePlayers)) {
       remote.update(delta);
     }
 
-    // 2. Client-side automatic health regeneration
+    // 3. Client-side automatic health regeneration
     this.checkHealthRegen();
   }
 
@@ -903,10 +938,10 @@ export class NetworkManager {
       } catch (_) {}
       this.room = null;
     }
-    for (const remote of this.remotePlayers.values()) {
-      remote.destroy();
+    for (const peerId of Object.keys(this.remotePlayers)) {
+      this.remotePlayers[peerId].destroy();
     }
-    this.remotePlayers.clear();
+    this.remotePlayers = {};
   }
 }
 
@@ -920,12 +955,13 @@ const WEAPONS_STATS = {
 // Representation of another connected player in 3D
 class RemotePlayer {
   constructor(data, scene) {
-    this.id = data.id;
+    this.id = data.id || data.peerId;
     this.username = data.username || 'Operative';
     this.color = data.color || '#00f0ff';
     this.weaponClass = data.weaponClass || 'assault';
     this.scene = scene;
     this.isAlive = data.isAlive !== false;
+    this.lastSeen = Date.now();
 
     this.currentPosition = new THREE.Vector3(data.position?.x || 0, data.position?.y || 0, data.position?.z || 0);
     this.targetPosition = new THREE.Vector3().copy(this.currentPosition);
@@ -942,85 +978,92 @@ class RemotePlayer {
     this.root.position.copy(this.currentPosition);
     this.scene.add(this.root);
 
-    this.buildMesh();
+    this.buildCharacterMesh();
     this.buildNameplate();
-    this.updateHealth(data.health || 100, 100);
+    this.updateHealth(data.health ?? 100);
   }
 
-  buildMesh() {
-    const playerColorHex = parseInt(this.color.replace('#', '0x'), 16);
-    const armorMat = new THREE.MeshStandardMaterial({
-      color: 0x1e293b,
-      metalness: 0.6,
-      roughness: 0.3
-    });
-    const teamMat = new THREE.MeshStandardMaterial({
-      color: playerColorHex,
-      metalness: 0.4,
-      roughness: 0.3
-    });
-    const visorMat = new THREE.MeshBasicMaterial({
-      color: playerColorHex
+  buildCharacterMesh() {
+    const suitMat = new THREE.MeshStandardMaterial({
+      color: 0x1a2333,
+      roughness: 0.6,
+      metalness: 0.4
     });
 
-    // 1. Torso / Body (Hitbox: body)
-    const torsoGeo = new THREE.BoxGeometry(0.7, 0.9, 0.4);
-    this.bodyMesh = new THREE.Mesh(torsoGeo, teamMat);
+    const armorMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(this.color),
+      roughness: 0.35,
+      metalness: 0.7
+    });
+
+    const visorMat = new THREE.MeshBasicMaterial({
+      color: 0x00ffff
+    });
+
+    // 1. Torso
+    const torsoGeo = new THREE.CylinderGeometry(0.35, 0.3, 0.9, 8);
+    this.bodyMesh = new THREE.Mesh(torsoGeo, suitMat);
     this.bodyMesh.position.y = 1.05;
     this.bodyMesh.castShadow = true;
     this.bodyMesh.receiveShadow = true;
-    this.bodyMesh.userData = {
+    this.root.add(this.bodyMesh);
+
+    // Armor chest plate
+    const chestGeo = new THREE.BoxGeometry(0.5, 0.45, 0.35);
+    const chestMesh = new THREE.Mesh(chestGeo, armorMat);
+    chestMesh.position.set(0, 0.1, 0.08);
+    this.bodyMesh.add(chestMesh);
+
+    // Body Hitbox
+    this.bodyHitbox = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.42, 0.42, 1.1, 8),
+      new THREE.MeshBasicMaterial({ visible: false })
+    );
+    this.bodyHitbox.position.y = 0.95;
+    this.bodyHitbox.userData = {
       isHitbox: true,
       hitboxType: 'body',
       playerId: this.id
     };
-    this.root.add(this.bodyMesh);
-    this.bodyHitbox = this.bodyMesh;
+    this.root.add(this.bodyHitbox);
 
-    // Tactical Chest Vest Plate
-    const vestGeo = new THREE.BoxGeometry(0.6, 0.5, 0.45);
-    const vest = new THREE.Mesh(vestGeo, armorMat);
-    vest.position.set(0, 0.05, 0);
-    this.bodyMesh.add(vest);
-
-    // 2. Head & Helmet (Hitbox: head)
-    const headGeo = new THREE.BoxGeometry(0.42, 0.45, 0.45);
-    this.headMesh = new THREE.Mesh(headGeo, armorMat);
+    // 2. Head & Helmet
+    this.headMesh = new THREE.Group();
     this.headMesh.position.y = 1.72;
-    this.headMesh.castShadow = true;
-    this.headMesh.userData = {
+    this.root.add(this.headMesh);
+
+    const helmetGeo = new THREE.SphereGeometry(0.28, 8, 8);
+    const helmet = new THREE.Mesh(helmetGeo, suitMat);
+    helmet.castShadow = true;
+    this.headMesh.add(helmet);
+
+    // Visor
+    const visorGeo = new THREE.BoxGeometry(0.32, 0.12, 0.18);
+    const visor = new THREE.Mesh(visorGeo, visorMat);
+    visor.position.set(0, 0.02, 0.2);
+    this.headMesh.add(visor);
+
+    // Head Hitbox (2x damage multiplier)
+    this.headHitbox = new THREE.Mesh(
+      new THREE.SphereGeometry(0.35, 8, 8),
+      new THREE.MeshBasicMaterial({ visible: false })
+    );
+    this.headHitbox.position.y = 1.72;
+    this.headHitbox.userData = {
       isHitbox: true,
       hitboxType: 'head',
       playerId: this.id
     };
-    this.root.add(this.headMesh);
-    this.headHitbox = this.headMesh;
+    this.root.add(this.headHitbox);
 
-    // Glowing Neon Visor on Face
-    const visorGeo = new THREE.BoxGeometry(0.34, 0.12, 0.08);
-    const visor = new THREE.Mesh(visorGeo, visorMat);
-    visor.position.set(0, 0.02, 0.22);
-    this.headMesh.add(visor);
-
-    // 3. Arms & Shoulders
-    const armGeo = new THREE.BoxGeometry(0.2, 0.75, 0.2);
-    this.leftArm = new THREE.Mesh(armGeo, armorMat);
-    this.leftArm.position.set(-0.48, 1.05, 0);
-    this.leftArm.castShadow = true;
-    this.root.add(this.leftArm);
-
-    this.rightArm = new THREE.Mesh(armGeo, armorMat);
-    this.rightArm.position.set(0.48, 1.05, 0);
-    this.rightArm.castShadow = true;
-    this.root.add(this.rightArm);
-
-    // 4. Legs
-    const legGeo = new THREE.BoxGeometry(0.24, 0.65, 0.24);
+    // 3. Left Leg
+    const legGeo = new THREE.CylinderGeometry(0.12, 0.1, 0.65, 6);
     this.leftLeg = new THREE.Mesh(legGeo, armorMat);
     this.leftLeg.position.set(-0.2, 0.32, 0);
     this.leftLeg.castShadow = true;
     this.root.add(this.leftLeg);
 
+    // 4. Right Leg
     this.rightLeg = new THREE.Mesh(legGeo, armorMat);
     this.rightLeg.position.set(0.2, 0.32, 0);
     this.rightLeg.castShadow = true;
